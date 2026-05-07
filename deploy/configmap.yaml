@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-scrape-config
+  namespace: kube-system
+  labels:
+    app: vector-k8s-helper
+data:
+  scrape_sources.yaml: |
+    sources:
+      no_targets:
+        type: prometheus_scrape
+        endpoints: []
+        scrape_interval_secs: 30
