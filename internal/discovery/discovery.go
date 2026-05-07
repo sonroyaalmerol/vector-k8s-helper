@@ -314,11 +314,15 @@ func resolveServicePort(svc *corev1.Service, portStr string) int32 {
 }
 
 // sanitizeIP replaces dots and colons in IP addresses for use in names.
+var sanitizeIPReplacer = strings.NewReplacer(".", "_", ":", "_")
+
 func sanitizeIP(ip string) string {
-	return strings.NewReplacer(".", "_", ":", "_").Replace(ip)
+	return sanitizeIPReplacer.Replace(ip)
 }
 
 // sanitizeName replaces characters invalid in Vector component names.
+var sanitizeNameReplacer = strings.NewReplacer(".", "_", "-", "_", "/", "_")
+
 func sanitizeName(name string) string {
-	return strings.NewReplacer(".", "_", "-", "_", "/", "_").Replace(name)
+	return sanitizeNameReplacer.Replace(name)
 }

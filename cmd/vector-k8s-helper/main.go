@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -88,7 +89,7 @@ func main() {
 			continue
 		}
 
-		if string(content) == string(lastContent) {
+		if bytes.Equal(content, lastContent) {
 			logger.Debug("config unchanged, skipping write")
 			continue
 		}

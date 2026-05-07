@@ -165,14 +165,15 @@ func extractPath(url string) string {
 	return after[slashIdx:]
 }
 
+var sanitizeReplacer = strings.NewReplacer(
+	".", "_",
+	"-", "_",
+	"/", "_",
+	":", "_",
+)
+
 func sanitize(s string) string {
-	r := strings.NewReplacer(
-		".", "_",
-		"-", "_",
-		"/", "_",
-		":", "_",
-	)
-	return r.Replace(s)
+	return sanitizeReplacer.Replace(s)
 }
 
 // buildRemapSource generates VRL that enriches metrics with k8s labels
