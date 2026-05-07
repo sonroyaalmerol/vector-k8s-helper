@@ -20,18 +20,48 @@ type Config struct {
 	MetricsAddr      string
 	ClusterLabel     string
 	AdditionalLabels map[string]string
+	AnnotationPrefix string
 }
 
 // TargetLabel is the standard Prometheus annotation for enabling scrape.
 const TargetLabel = "prometheus.io/scrape"
 
-// Common Prometheus annotation keys.
+// Prometheus annotation keys.
 const (
-	AnnotationScrape = "prometheus.io/scrape"
-	AnnotationPort   = "prometheus.io/port"
-	AnnotationPath   = "prometheus.io/path"
-	AnnotationScheme = "prometheus.io/scheme"
+	AnnotationScrape = "scrape"
+	AnnotationPort   = "port"
+	AnnotationPath   = "path"
+	AnnotationScheme = "scheme"
+
+	// Extended annotations.
+	AnnotationParams                      = "params"
+	AnnotationJob                         = "job"
+	AnnotationCollectionInterval          = "collectionInterval"
+	AnnotationCollectionTimeout           = "collectionTimeout"
+	AnnotationServiceAccountBearerToken   = "serviceAccountBearerToken"
+	AnnotationHTTPProxyURL                = "httpProxyURL"
+	AnnotationTLSServerName               = "tlsServerName"
+	AnnotationTLSInsecureSkipVerify       = "tlsInsecureSkipVerify"
+	AnnotationHTTPBasicAuthUsernameEnvVar = "httpBasicAuthUsernameEnvVar"
+	AnnotationHTTPBasicAuthPasswordEnvVar = "httpBasicAuthPasswordEnvVar"
+	AnnotationHTTPBasicAuthPasswordFile   = "httpBasicAuthPasswordFile"
+	AnnotationHTTPBearerTokenEnvVar       = "httpBearerTokenEnvVar"
+	AnnotationHTTPBearerTokenFile         = "httpBearerTokenFile"
+	AnnotationTLSCAFile                   = "tlsCAFile"
+	AnnotationTLSCertFile                 = "tlsCertFile"
+	AnnotationTLSKeyFile                  = "tlsKeyFile"
+
+	// ExclusionAnnotation marks a pod/service to be excluded from scraping.
+	ExclusionAnnotation = "vector.dev/exclude"
 )
+
+const defaultAnnotationPrefix = "prometheus.io"
+
+// Annot returns the full annotation key for the given short name using the
+// configured annotation prefix (e.g. Annot("scrape") → "prometheus.io/scrape").
+func (c Config) Annot(key string) string {
+	return c.AnnotationPrefix + "/" + key
+}
 
 // Load reads configuration from environment variables with sensible defaults.
 func Load() (Config, error) {
@@ -46,6 +76,7 @@ func Load() (Config, error) {
 		MetricsAddr:      envOr("METRICS_LISTEN_ADDR", ":9090"),
 		ClusterLabel:     envOr("CLUSTER_LABEL", ""),
 		AdditionalLabels: labelsEnvOr("ADDITIONAL_LABELS"),
+		AnnotationPrefix: envOr("ANNOTATION_PREFIX", defaultAnnotationPrefix),
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
