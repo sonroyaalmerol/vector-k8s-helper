@@ -10,16 +10,16 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	Namespace         string
-	ConfigMapName     string
-	ConfigMapKey      string
-	ScrapeInterval    time.Duration
-	ResyncInterval    time.Duration
-	MetricsAddr       string
-	TargetAnnotation  string
-	ExcludeAnnotation string
-	ClusterLabel      string
-	AdditionalLabels  map[string]string
+	Namespace        string
+	ConfigMapName    string
+	ConfigMapKey     string
+	ScrapeInterval   time.Duration
+	ScrapeTimeout    time.Duration
+	HonorLabels      bool
+	ResyncInterval   time.Duration
+	MetricsAddr      string
+	ClusterLabel     string
+	AdditionalLabels map[string]string
 }
 
 // TargetLabel is the standard Prometheus annotation for enabling scrape.
@@ -40,6 +40,8 @@ func Load() (Config, error) {
 		ConfigMapName:    envOr("CONFIGMAP_NAME", "vector-scrape-config"),
 		ConfigMapKey:     envOr("CONFIGMAP_KEY", "scrape_sources.yaml"),
 		ScrapeInterval:   durEnvOr("SCRAPE_INTERVAL", 30*time.Second),
+		ScrapeTimeout:    durEnvOr("SCRAPE_TIMEOUT", 10*time.Second),
+		HonorLabels:      boolEnvOr("HONOR_LABELS", false),
 		ResyncInterval:   durEnvOr("RESYNC_INTERVAL", 5*time.Minute),
 		MetricsAddr:      envOr("METRICS_LISTEN_ADDR", ":9090"),
 		ClusterLabel:     envOr("CLUSTER_LABEL", ""),
@@ -106,6 +108,18 @@ func labelsEnvOr(key string) map[string]string {
 		return nil
 	}
 	return m
+}
+
+func boolEnvOr(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
 
 func indexByte(s string, b byte) int {

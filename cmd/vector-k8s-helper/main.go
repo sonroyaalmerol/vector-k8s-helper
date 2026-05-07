@@ -4,7 +4,9 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -35,7 +37,9 @@ func main() {
 		"namespace", cfg.Namespace,
 		"configmap", cfg.ConfigMapName,
 		"scrape_interval", cfg.ScrapeInterval,
+		"scrape_timeout", cfg.ScrapeTimeout,
 		"cluster_label", cfg.ClusterLabel,
+		"honor_labels", cfg.HonorLabels,
 	)
 
 	k8sCfg, err := rest.InClusterConfig()
@@ -53,11 +57,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Start health/metrics server.
+	go serveHealth(ctx, cfg.MetricsAddr, logger)
+
 	w := discovery.NewWatcher(client, cfg, logger)
 	wr := writer.NewWriter(client, cfg.Namespace, cfg.ConfigMapKey, logger)
 
 	rendCfg := renderer.Config{
 		ScrapeIntervalSecs: cfg.ScrapeInterval.Seconds(),
+		ScrapeTimeoutSecs:  cfg.ScrapeTimeout.Seconds(),
+		HonorLabels:        cfg.HonorLabels,
 		ClusterLabel:       cfg.ClusterLabel,
 		AdditionalLabels:   cfg.AdditionalLabels,
 	}
@@ -69,7 +78,6 @@ func main() {
 		}
 	}()
 
-	// Wait for initial target list, then render and write.
 	var lastContent []byte
 	for targets := range w.Output() {
 		logger.Info("targets changed", "count", len(targets))
@@ -94,4 +102,38 @@ func main() {
 	}
 
 	logger.Info("shutting down")
+}
+
+// serveHealth starts a simple HTTP server for health checks.
+// The /health endpoint responds with 200 OK, allowing the helper
+// pod to be annotated with prometheus.io/scrape for self-monitoring.
+func serveHealth(ctx context.Context, addr string, logger *slog.Logger) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		logger.Info("health server listening", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && ctx.Err() == nil {
+			logger.Error("health server error", "error", err)
+		}
+	}()
+	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("health server shutdown error", "error", err)
+	}
+}
+
+// buildVersion is set at build time via -ldflags.
+var buildVersion = "dev"
+
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "vector-k8s-helper %s\n\nUsage:\n", buildVersion)
+		flag.PrintDefaults()
+	}
 }

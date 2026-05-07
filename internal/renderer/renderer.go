@@ -13,6 +13,8 @@ import (
 // Config holds the rendering parameters.
 type Config struct {
 	ScrapeIntervalSecs float64
+	ScrapeTimeoutSecs  float64
+	HonorLabels        bool
 	ClusterLabel       string
 	AdditionalLabels   map[string]string
 }
@@ -29,6 +31,8 @@ type SourceConfig struct {
 	Type               string   `yaml:"type"`
 	Endpoints          []string `yaml:"endpoints"`
 	ScrapeIntervalSecs float64  `yaml:"scrape_interval_secs"`
+	ScrapeTimeoutSecs  float64  `yaml:"scrape_timeout_secs"`
+	HonorLabels        bool     `yaml:"honor_labels,omitempty"`
 }
 
 // TransformConfig represents a Vector remap transform.
@@ -60,6 +64,8 @@ func Render(targets []discovery.Target, cfg Config) ([]byte, error) {
 			Type:               "prometheus_scrape",
 			Endpoints:          endpoints,
 			ScrapeIntervalSecs: cfg.ScrapeIntervalSecs,
+			ScrapeTimeoutSecs:  cfg.ScrapeTimeoutSecs,
+			HonorLabels:        cfg.HonorLabels,
 		}
 		sourceNames = append(sourceNames, name)
 	}
@@ -99,6 +105,7 @@ func RenderEmpty(cfg Config) ([]byte, error) {
 				Type:               "prometheus_scrape",
 				Endpoints:          []string{},
 				ScrapeIntervalSecs: cfg.ScrapeIntervalSecs,
+				ScrapeTimeoutSecs:  cfg.ScrapeTimeoutSecs,
 			},
 		},
 	}
@@ -120,7 +127,6 @@ type targetGroup struct {
 func groupBySchemePath(targets []discovery.Target) map[string][]discovery.Target {
 	groups := make(map[targetGroup][]discovery.Target)
 	for _, t := range targets {
-		// Extract scheme and path from URL to group similar targets.
 		key := targetGroup{
 			scheme: extractScheme(t.URL),
 			path:   extractPath(t.URL),
@@ -148,17 +154,15 @@ func extractScheme(url string) string {
 }
 
 func extractPath(url string) string {
-	// After scheme://host:port, get the path.
 	_, after, ok := strings.Cut(url, "://")
 	if !ok {
 		return "/metrics"
 	}
-	rest := after
-	slashIdx := strings.Index(rest, "/")
+	slashIdx := strings.Index(after, "/")
 	if slashIdx < 0 {
 		return "/"
 	}
-	return rest[slashIdx:]
+	return after[slashIdx:]
 }
 
 func sanitize(s string) string {
@@ -181,7 +185,6 @@ func buildRemapSource(targets []discovery.Target, cfg Config) string {
 	b.WriteString("# Enriches prometheus_scrape metrics with k8s labels.\n\n")
 	b.WriteString("metadata = {\n")
 
-	// Group by instance for the lookup table.
 	seen := make(map[string]bool)
 	for _, t := range targets {
 		if t.Instance == "" || seen[t.Instance] {

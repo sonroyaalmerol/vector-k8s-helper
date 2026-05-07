@@ -1,4 +1,4 @@
-// Package discovery watches the Kubernetes API for pods and services
+// Package discovery watches the Kubernetes API for pods and endpoint slices
 // annotated with prometheus.io/scrape and produces Target lists.
 package discovery
 
@@ -13,6 +13,7 @@ import (
 
 	"github.com/sonroyaalmerol/vector-k8s-helper/internal/config"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -30,8 +31,13 @@ type Target struct {
 	Instance  string // host:port, used as VRL lookup key
 }
 
-// Watcher watches Kubernetes pods and services for scrape annotations and
-// emits the full target list whenever the set changes.
+// SanitizedName returns a DNS-safe identifier suitable for Vector source names.
+func (t Target) SanitizedName() string {
+	return sanitizeName(t.Name)
+}
+
+// Watcher watches Kubernetes pods and endpoint slices for scrape annotations
+// and emits the full target list whenever the set changes.
 type Watcher struct {
 	cfg      config.Config
 	client   kubernetes.Interface
@@ -41,6 +47,7 @@ type Watcher struct {
 	output   chan []Target
 	podStore cache.Store
 	svcStore cache.Store
+	epStore  cache.Store
 }
 
 // NewWatcher creates a Watcher using the provided K8s client and configuration.
@@ -69,9 +76,11 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	podInf := factory.Core().V1().Pods().Informer()
 	svcInf := factory.Core().V1().Services().Informer()
+	epInf := factory.Discovery().V1().EndpointSlices().Informer()
 
 	w.podStore = podInf.GetStore()
 	w.svcStore = svcInf.GetStore()
+	w.epStore = epInf.GetStore()
 
 	handler := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(_ any) { w.reconcile() },
@@ -84,11 +93,14 @@ func (w *Watcher) Run(ctx context.Context) error {
 	if _, err := svcInf.AddEventHandler(handler); err != nil {
 		return fmt.Errorf("failed to add service handler: %w", err)
 	}
+	if _, err := epInf.AddEventHandler(handler); err != nil {
+		return fmt.Errorf("failed to add endpoints handler: %w", err)
+	}
 
 	factory.Start(ctx.Done())
-	w.logger.Info("started kubernetes informers")
+	w.logger.Info("started kubernetes informers", "namespace", cfgNamespace(w.cfg.Namespace))
 
-	if !cache.WaitForCacheSync(ctx.Done(), podInf.HasSynced, svcInf.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), podInf.HasSynced, svcInf.HasSynced, epInf.HasSynced) {
 		return fmt.Errorf("informer cache sync cancelled")
 	}
 	w.logger.Info("informer cache synced")
@@ -98,28 +110,51 @@ func (w *Watcher) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
+func cfgNamespace(ns string) string {
+	if ns == "" {
+		return "<all>"
+	}
+	return ns
+}
+
 func (w *Watcher) reconcile() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	newTargets := make(map[string]Target)
 
+	// Pod targets: pods with prometheus.io/scrape annotation.
 	for _, obj := range w.podStore.List() {
 		pod, ok := obj.(*corev1.Pod)
 		if !ok {
 			continue
 		}
-		for _, t := range targetsFromPod(pod, w.cfg) {
+		for _, t := range targetsFromPod(pod) {
 			newTargets[t.Name] = t
 		}
 	}
 
-	for _, obj := range w.svcStore.List() {
-		svc, ok := obj.(*corev1.Service)
+	// Endpoint targets: services with prometheus.io/scrape annotated,
+	// resolved to ready pod IPs via EndpointSlice objects.
+	for _, obj := range w.epStore.List() {
+		epSlice, ok := obj.(*discoveryv1.EndpointSlice)
 		if !ok {
 			continue
 		}
-		for _, t := range targetsFromService(svc, w.cfg) {
+		svcName := epSlice.Labels[discoveryv1.LabelServiceName]
+		if svcName == "" {
+			continue
+		}
+		// Look up the corresponding Service from the store.
+		svcObj, exists, err := w.svcStore.GetByKey(fmt.Sprintf("%s/%s", epSlice.Namespace, svcName))
+		if err != nil || !exists {
+			continue
+		}
+		svc, ok := svcObj.(*corev1.Service)
+		if !ok {
+			continue
+		}
+		for _, t := range targetsFromEndpointSlice(epSlice, svc) {
 			newTargets[t.Name] = t
 		}
 	}
@@ -137,7 +172,6 @@ func (w *Watcher) emit() {
 	select {
 	case w.output <- snapshot:
 	default:
-		// Drain stale entry and resend.
 		select {
 		case <-w.output:
 		default:
@@ -147,7 +181,8 @@ func (w *Watcher) emit() {
 }
 
 // targetsFromPod extracts scrape targets from a Pod's annotations.
-func targetsFromPod(pod *corev1.Pod, cfg config.Config) []Target {
+// This covers the Alloy discovery.relabel "pods" path.
+func targetsFromPod(pod *corev1.Pod) []Target {
 	ann := pod.Annotations
 	if ann == nil {
 		return nil
@@ -196,16 +231,16 @@ func targetsFromPod(pod *corev1.Pod, cfg config.Config) []Target {
 	return targets
 }
 
-// targetsFromService extracts scrape targets from a Service's annotations.
-func targetsFromService(svc *corev1.Service, cfg config.Config) []Target {
+// targetsFromEndpointSlice extracts scrape targets from an EndpointSlice and
+// its associated Service. This covers the Alloy discovery.relabel "endpoints"
+// path — it resolves services to their ready pod IPs rather than the ClusterIP,
+// matching Alloy's behavior of using endpoint role discovery.
+func targetsFromEndpointSlice(epSlice *discoveryv1.EndpointSlice, svc *corev1.Service) []Target {
 	ann := svc.Annotations
 	if ann == nil {
 		return nil
 	}
 	if !config.ParseBool(ann[config.AnnotationScrape], false) {
-		return nil
-	}
-	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
 		return nil
 	}
 
@@ -224,16 +259,29 @@ func targetsFromService(svc *corev1.Service, cfg config.Config) []Target {
 		return nil
 	}
 
-	hostPort := net.JoinHostPort(svc.Spec.ClusterIP, strconv.Itoa(int(port)))
-	name := fmt.Sprintf("svc_%s_%s", svc.Namespace, svc.Name)
-
-	return []Target{{
-		Name:      sanitizeName(name),
-		URL:       fmt.Sprintf("%s://%s%s", scheme, hostPort, path),
-		Namespace: svc.Namespace,
-		Service:   svc.Name,
-		Instance:  hostPort,
-	}}
+	var targets []Target
+	for _, ep := range epSlice.Endpoints {
+		if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
+			continue
+		}
+		for _, addr := range ep.Addresses {
+			hostPort := net.JoinHostPort(addr, strconv.Itoa(int(port)))
+			podName := ""
+			if ep.TargetRef != nil && ep.TargetRef.Kind == "Pod" {
+				podName = ep.TargetRef.Name
+			}
+			name := fmt.Sprintf("ep_%s_%s_%s", epSlice.Namespace, svc.Name, sanitizeIP(addr))
+			targets = append(targets, Target{
+				Name:      sanitizeName(name),
+				URL:       fmt.Sprintf("%s://%s%s", scheme, hostPort, path),
+				Namespace: epSlice.Namespace,
+				Service:   svc.Name,
+				Pod:       podName,
+				Instance:  hostPort,
+			})
+		}
+	}
+	return targets
 }
 
 // resolveContainerPort finds the scrape port for a container.
@@ -265,12 +313,12 @@ func resolveServicePort(svc *corev1.Service, portStr string) int32 {
 	return svc.Spec.Ports[0].Port
 }
 
+// sanitizeIP replaces dots and colons in IP addresses for use in names.
+func sanitizeIP(ip string) string {
+	return strings.NewReplacer(".", "_", ":", "_").Replace(ip)
+}
+
 // sanitizeName replaces characters invalid in Vector component names.
 func sanitizeName(name string) string {
-	r := strings.NewReplacer(
-		".", "_",
-		"-", "_",
-		"/", "_",
-	)
-	return r.Replace(name)
+	return strings.NewReplacer(".", "_", "-", "_", "/", "_").Replace(name)
 }

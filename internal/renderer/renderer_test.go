@@ -10,6 +10,7 @@ import (
 func TestRenderEmpty(t *testing.T) {
 	cfg := Config{
 		ScrapeIntervalSecs: 30,
+		ScrapeTimeoutSecs:  10,
 	}
 	data, err := RenderEmpty(cfg)
 	if err != nil {
@@ -22,6 +23,12 @@ func TestRenderEmpty(t *testing.T) {
 	}
 	if len(result.Sources) != 1 {
 		t.Errorf("expected 1 source, got %d", len(result.Sources))
+	}
+	// Verify scrape_timeout_secs is set.
+	for _, src := range result.Sources {
+		if src.ScrapeTimeoutSecs != 10 {
+			t.Errorf("expected scrape_timeout_secs=10, got %v", src.ScrapeTimeoutSecs)
+		}
 	}
 }
 
@@ -37,16 +44,18 @@ func TestRenderWithTargets(t *testing.T) {
 			Instance:  "10.0.0.5:9090",
 		},
 		{
-			Name:      "svc_production_myapp",
-			URL:       "http://10.96.0.50:8080/metrics",
+			Name:      "ep_production_myapp_10_0_1_5",
+			URL:       "http://10.0.1.5:9090/metrics",
 			Namespace: "production",
 			Service:   "myapp",
-			Instance:  "10.96.0.50:8080",
+			Pod:       "myapp-abc123",
+			Instance:  "10.0.1.5:9090",
 		},
 	}
 
 	cfg := Config{
 		ScrapeIntervalSecs: 30,
+		ScrapeTimeoutSecs:  10,
 		ClusterLabel:       "dmz-prod-1",
 	}
 
@@ -64,7 +73,6 @@ func TestRenderWithTargets(t *testing.T) {
 		t.Error("expected at least 1 source")
 	}
 
-	// Verify transform exists with cluster label.
 	transform, ok := result.Transforms["enrich_metrics"]
 	if !ok {
 		t.Fatal("expected enrich_metrics transform")
@@ -78,11 +86,19 @@ func TestRenderWithTargets(t *testing.T) {
 	if transform.Source == "" {
 		t.Error("expected remap source to be non-empty")
 	}
+
+	// Verify scrape_timeout_secs and honor_labels on sources.
+	for name, src := range result.Sources {
+		if src.ScrapeTimeoutSecs != 10 {
+			t.Errorf("source %s: expected scrape_timeout_secs=10, got %v", name, src.ScrapeTimeoutSecs)
+		}
+	}
 }
 
 func TestRenderNoTargetsProducesValidConfig(t *testing.T) {
 	cfg := Config{
 		ScrapeIntervalSecs: 30,
+		ScrapeTimeoutSecs:  10,
 	}
 	data, err := Render(nil, cfg)
 	if err != nil {
@@ -93,8 +109,41 @@ func TestRenderNoTargetsProducesValidConfig(t *testing.T) {
 	if err := yaml.Unmarshal(data, &result); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	// With no targets we should still get valid YAML with the no_targets fallback.
 	if len(result.Sources) == 0 {
 		t.Error("expected at least 1 source in fallback config")
+	}
+}
+
+func TestRenderHonorLabels(t *testing.T) {
+	targets := []discovery.Target{
+		{
+			Name:      "pod_test_app",
+			URL:       "http://10.0.0.1:9090/metrics",
+			Namespace: "default",
+			Pod:       "test-pod",
+			Instance:  "10.0.0.1:9090",
+		},
+	}
+
+	cfg := Config{
+		ScrapeIntervalSecs: 30,
+		ScrapeTimeoutSecs:  10,
+		HonorLabels:        true,
+	}
+
+	data, err := Render(targets, cfg)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	var result VectorSources
+	if err := yaml.Unmarshal(data, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, src := range result.Sources {
+		if !src.HonorLabels {
+			t.Error("expected honor_labels=true")
+		}
 	}
 }

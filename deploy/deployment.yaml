@@ -12,6 +12,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "services"]
     verbs: ["list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "create", "update", "patch"]
@@ -45,6 +48,11 @@ spec:
     metadata:
       labels:
         app: vector-k8s-helper
+      annotations:
+        # Self-monitoring: the helper discovers itself via this annotation.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/health"
     spec:
       serviceAccountName: vector-k8s-helper
       containers:
@@ -61,6 +69,8 @@ spec:
               value: "scrape_sources.yaml"
             - name: SCRAPE_INTERVAL
               value: "30s"
+            - name: SCRAPE_TIMEOUT
+              value: "10s"
             - name: CLUSTER_LABEL
               value: ""
           resources:
