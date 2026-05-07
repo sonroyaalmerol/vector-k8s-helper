@@ -3,7 +3,7 @@ package renderer
 import (
 	"testing"
 
-	"github.com/sgl/vector-k8s-helper/internal/discovery"
+	"github.com/sonroyaalmerol/vector-k8s-helper/internal/discovery"
 	"gopkg.in/yaml.v3"
 )
 

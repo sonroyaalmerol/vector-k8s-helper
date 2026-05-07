@@ -3,7 +3,7 @@ package discovery
 import (
 	"testing"
 
-	"github.com/sgl/vector-k8s-helper/internal/config"
+	"github.com/sonroyaalmerol/vector-k8s-helper/internal/config"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )

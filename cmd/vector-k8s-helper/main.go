@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sgl/vector-k8s-helper/internal/config"
-	"github.com/sgl/vector-k8s-helper/internal/discovery"
-	"github.com/sgl/vector-k8s-helper/internal/renderer"
-	"github.com/sgl/vector-k8s-helper/internal/writer"
+	"github.com/sonroyaalmerol/vector-k8s-helper/internal/config"
+	"github.com/sonroyaalmerol/vector-k8s-helper/internal/discovery"
+	"github.com/sonroyaalmerol/vector-k8s-helper/internal/renderer"
+	"github.com/sonroyaalmerol/vector-k8s-helper/internal/writer"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )

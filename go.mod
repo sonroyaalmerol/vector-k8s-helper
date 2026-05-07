@@ -1,4 +1,4 @@
-module github.com/sgl/vector-k8s-helper
+module github.com/sonroyaalmerol/vector-k8s-helper
 
 go 1.26.2
 

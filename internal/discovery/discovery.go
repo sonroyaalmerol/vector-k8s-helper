@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sgl/vector-k8s-helper/internal/config"
+	"github.com/sonroyaalmerol/vector-k8s-helper/internal/config"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
