@@ -27,6 +27,7 @@ type SourceConfig struct {
 	Endpoints          []string    `yaml:"endpoints"`
 	ScrapeIntervalSecs float64     `yaml:"scrape_interval_secs"`
 	ScrapeTimeoutSecs  float64     `yaml:"scrape_timeout_secs"`
+	InstanceTag        string      `yaml:"instance_tag"`
 	HonorLabels        bool        `yaml:"honor_labels,omitempty"`
 	Auth               *AuthConfig `yaml:"auth,omitempty"`
 	TLS                *TLSConfig  `yaml:"tls,omitempty"`
@@ -84,6 +85,7 @@ func Render(targets []discovery.Target, cfg Config) ([]byte, error) {
 			Endpoints:          endpoints,
 			ScrapeIntervalSecs: intervalSecs,
 			ScrapeTimeoutSecs:  timeoutSecs,
+			InstanceTag:        "instance",
 			HonorLabels:        cfg.HonorLabels,
 		}
 
@@ -126,6 +128,7 @@ func RenderEmpty(cfg Config) ([]byte, error) {
 				Endpoints:          []string{},
 				ScrapeIntervalSecs: cfg.ScrapeIntervalSecs,
 				ScrapeTimeoutSecs:  cfg.ScrapeTimeoutSecs,
+				InstanceTag:        "instance",
 			},
 		},
 		Transforms: map[string]TransformConfig{
