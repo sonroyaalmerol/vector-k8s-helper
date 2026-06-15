@@ -305,7 +305,7 @@ func buildRemapSource(targets []discovery.Target, cfg Config) string {
 	b.Grow(len(entries)*256 + 256)
 
 	b.WriteString("inst = .tags.instance\n")
-	b.WriteString("m = metadata[inst]\n")
+	b.WriteString("m = get!(.metadata, [inst])\n")
 	b.WriteString("if m != null {\n")
 	for _, line := range enrichLines() {
 		b.WriteString("  ")
