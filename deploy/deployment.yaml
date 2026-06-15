@@ -59,7 +59,7 @@ spec:
         - operator: Exists
       containers:
         - name: helper
-          image: ghcr.io/sonroyaalmerol/vector-k8s-helper:v0.5.0
+          image: ghcr.io/sonroyaalmerol/vector-k8s-helper:0.6.0
           imagePullPolicy: Always
           env:
             - name: VECTOR_SELF_NODE_NAME
