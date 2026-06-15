@@ -7,8 +7,8 @@ Internal package documentation for `vector-k8s-helper`.
 ```
 github.com/sonroyaalmerol/vector-k8s-helper
 ├── cmd/vector-k8s-helper   # Entrypoint
-├── internal/config          # Configuration
-├── internal/discovery       # K8s informer-based target discovery
+├── internal/config          # Environment configuration
+├── internal/discovery       # Kubernetes informer-based target discovery
 ├── internal/renderer        # Vector YAML config generation
 └── internal/writer          # ConfigMap persistence
 ```
@@ -25,66 +25,162 @@ import "github.com/sonroyaalmerol/vector-k8s-helper/internal/config"
 
 #### `Config`
 
+All runtime configuration. Populated by `Load` from environment variables.
+
 ```go
 type Config struct {
-    Namespace         string            // K8s namespace to watch ("": all)
-    ConfigMapName     string            // Target ConfigMap name
-    ConfigMapKey      string            // ConfigMap data key
-    ScrapeInterval    time.Duration     // Prometheus scrape interval
-    ResyncInterval    time.Duration     // Informer resync interval
-    MetricsAddr       string            // Health server listen address
-    TargetAnnotation  string            // Annotation key for enabling scrape
-    ExcludeAnnotation string            // Annotation key for excluding pods
-    ClusterLabel      string            // Static cluster label
-    AdditionalLabels  map[string]string // Extra labels to add
+    Namespace        string
+    ConfigMapName    string
+    ConfigMapKey     string
+    ScrapeInterval   time.Duration
+    ScrapeTimeout    time.Duration
+    HonorLabels      bool
+    ResyncInterval   time.Duration
+    DebounceInterval time.Duration
+    MetricsAddr      string
+    ClusterLabel     string
+    AdditionalLabels map[string]string
+    AnnotationPrefix string
+
+    Roles              Roles
+    Selectors          Selectors
+    Namespaces         NamespaceFilter
+    AttachNodeMetadata bool
+    AttachNsMetadata   bool
+    IncludeAnnotations bool
+    IncludeLabels      bool
+    NodeScrapePort     int32
+    ServiceDNSSuffix   string
 }
 ```
+
+#### `Roles`
+
+Bitset of enabled discovery roles.
+
+```go
+type Roles struct {
+    Pod            bool
+    Endpoints      bool
+    EndpointSlice  bool
+    Node           bool
+    Ingress        bool
+    ServiceAddress bool
+}
+```
+
+Methods: `Any() bool` (true if any role is on), `Slice() []string` (role names),
+`String() string` (comma-joined).
+
+#### `Selectors`
+
+Label and field selectors per role, applied at informer construction.
+
+```go
+type Selectors struct {
+    PodLabel, PodField                         string
+    ServiceLabel, ServiceField                 string
+    NodeLabel, NodeField                       string
+    IngressLabel, IngressField                 string
+    EndpointSliceLabel, EndpointSliceField     string
+    EndpointsLabel, EndpointsField             string
+}
+```
+
+#### `NamespaceFilter`
+
+```go
+type NamespaceFilter struct {
+    Include []string
+    Exclude []string
+}
+
+func (nf NamespaceFilter) Allowed(namespace string) bool
+```
+
+`Allowed` returns `false` if the namespace is in `Exclude`; otherwise `true` if
+`Include` is empty or contains the namespace.
 
 ### Functions
 
 #### `Load() (Config, error)`
 
-Reads all configuration from environment variables. Returns an error if
-required values are invalid.
+Reads and validates all configuration from environment variables. Returns an
+error if `CONFIGMAP_NAME` is empty, `SCRAPE_INTERVAL` is below 5s, or
+`DEBOUNCE_INTERVAL` is negative.
 
 #### `ParseBool(s string, fallback bool) bool`
 
-Parses a boolean string, returning `fallback` on failure. Used for
-annotation value parsing.
+Parses a boolean string with a fallback. Used for annotation value parsing.
 
 ### Constants
 
-| Constant | Value |
-|---|---|
-| `AnnotationScrape` | `"prometheus.io/scrape"` |
-| `AnnotationPort` | `"prometheus.io/port"` |
-| `AnnotationPath` | `"prometheus.io/path"` |
-| `AnnotationScheme` | `"prometheus.io/scheme"` |
+Annotation suffixes (combined with `AnnotationPrefix` at runtime):
+
+`AnnotationScrape`, `AnnotationPort`, `AnnotationPath`, `AnnotationScheme`,
+`AnnotationParams`, `AnnotationJob`, `AnnotationCollectionInterval`,
+`AnnotationCollectionTimeout`, `AnnotationServiceAccountBearerToken`,
+`AnnotationTLSServerName`, `AnnotationTLSInsecureSkipVerify`,
+`AnnotationHTTPBasicAuthUsernameEnv`, `AnnotationHTTPBasicAuthPasswordEnv`,
+`AnnotationHTTPBearerTokenEnv`, `AnnotationTLSCAFile`, `AnnotationTLSCertFile`,
+`AnnotationTLSKeyFile`.
+
+`ExclusionAnnotation` = `"vector.dev/exclude"`.
+
+`defaultAnnotationPrefix` = `"prometheus.io"`.
 
 ---
 
 ## `internal/discovery`
 
 ```go
-import "github.com/sonroyaalmerol/vector-k8s-helper/internal/discovery"
+import "github.com/sonroyaalmerol/vector-k8s-helper/internal/config"
 ```
 
-### Types
+### types
 
 #### `Target`
 
+A single scrape target with its full metadata payload.
+
 ```go
 type Target struct {
-    Name      string // Sanitized component name (e.g., pod_kube_system_coredns_app)
-    URL       string // Fully-qualified: scheme://host:port/path
-    Namespace string // K8s namespace
-    Pod       string // Pod name (empty for service targets)
-    Service   string // Service name (empty for pod targets)
-    Node      string // Node name (pod targets only)
-    Container string // Container name (pod targets only)
-    Instance  string // host:port, used as VRL lookup key
+    Name, URL, Instance, Role string
+    Namespace, Pod, Service, Node, Container, Job string
+
+    PodUID, PodPhase, PodReady                 string
+    ControllerKind, ControllerName             string
+    ContainerImage, ContainerID, ContainerInit string
+    HostIP, PodIP, NodeIP, ServicePortName     string
+
+    PortName, PortNumber, PortProtocol         string
+
+    ServiceType, ServiceClusterIP, ServiceExternalName string
+
+    NodeProviderID    string
+    NodeAddresses     map[string]string
+
+    EndpointReady, EndpointHostname, EndpointNodeName string
+    EndpointZone, EndpointAddressType, EndpointSliceName string
+
+    IngressClassName, IngressPath, IngressScheme string
+
+    ScrapeInterval, ScrapeTimeout time.Duration
+    Params                        string
+
+    BasicAuthUserEnv, BasicAuthPassword string
+    BearerTokenEnv, BearerToken         string
+
+    TLSServerName         string
+    TLSInsecureSkipVerify bool
+    TLSCAFile, TLSCertFile, TLSKeyFile string
+
+    Labels, Annotations map[string]string
 }
 ```
+
+`Instance` is always `host:port` and is the key used by the renderer's VRL
+lookup table.
 
 #### `Watcher`
 
@@ -92,40 +188,41 @@ type Target struct {
 type Watcher struct { /* unexported fields */ }
 ```
 
-Watches K8s Pods and Services for scrape annotations. Emits the full
-target list on every change via a buffered channel.
+Watches Kubernetes resources for scrape annotations across the enabled roles
+and emits full target snapshots.
 
 ##### `NewWatcher(client kubernetes.Interface, cfg config.Config, logger *slog.Logger) *Watcher`
 
-Creates a new Watcher. Does not start watching until `Run()` is called.
+Creates a Watcher. Does not start until `Run` is called.
 
 ##### `(w *Watcher) Output() <-chan []Target`
 
-Returns a channel that receives snapshot target lists. The channel has
-buffer size 1; stale snapshots are replaced.
+Returns a buffered (capacity 1) channel of target snapshots. The latest
+snapshot replaces any pending one.
 
 ##### `(w *Watcher) Run(ctx context.Context) error`
 
-Starts informers and blocks until `ctx` is cancelled. Returns
-`ctx.Err()` on normal shutdown.
+Starts the per-role informers, waits for cache sync, and blocks until `ctx` is
+cancelled. Returns an error if no roles are enabled or cache sync fails.
 
-### Helper Functions
+### Target extractors
 
-#### `targetsFromPod(pod *corev1.Pod, cfg config.Config) []Target`
+Each role has an extractor that builds `[]Target` from a single object (plus,
+for endpoint roles, the owning Service and supporting stores):
 
-Extracts scrape targets from a single Pod. Returns one target per
-container when `prometheus.io/scrape` is `"true"`. Skips pods with
-`vector.dev/exclude: "true"`, pods without an IP, or pods where no
-port can be determined.
+| Function | Role | Signature |
+|---|---|---|
+| `targetsFromPod` | pod | `(pod *corev1.Pod, cfg config.Config, k keys) []Target` |
+| `targetsFromEndpointSlice` | endpointslice | `(epSlice *discoveryv1.EndpointSlice, svc *corev1.Service, cfg config.Config, k keys, podStore, nodeStore, nsStore cache.Store) []Target` |
+| `targetsFromEndpoints` | endpoints | `(eps *corev1.Endpoints, svc *corev1.Service, cfg config.Config, k keys, podStore, nodeStore, nsStore cache.Store) []Target` |
+| `targetsFromService` | service | `(svc *corev1.Service, cfg config.Config, k keys, nsStore cache.Store) []Target` |
+| `targetsFromNode` | node | `(node *corev1.Node, cfg config.Config, k keys) []Target` |
+| `targetsFromIngress` | ingress | `(ing *netv1.Ingress, cfg config.Config, k keys) []Target` |
 
-#### `targetsFromService(svc *corev1.Service, cfg config.Config) []Target`
+Port resolution helpers:
 
-Extracts a scrape target from a single Service. Skips headless services
-(`ClusterIP: None`) and services without the scrape annotation.
-
-#### `sanitizeName(name string) string`
-
-Replaces `.`, `-`, `/` with `_` to produce valid Vector component names.
+- `resolveEndpointPorts(ports []discoveryv1.EndpointPort, scrapePortStr string) []discoveryv1.EndpointPort` — selects the subset port matching the service's `prometheus.io/port` annotation, or returns all ports when unset.
+- `resolveSubsetPorts(ports []corev1.EndpointPort, scrapePortStr string) []corev1.EndpointPort` — same logic for legacy `Endpoints`.
 
 ---
 
@@ -142,8 +239,63 @@ import "github.com/sonroyaalmerol/vector-k8s-helper/internal/renderer"
 ```go
 type Config struct {
     ScrapeIntervalSecs float64
+    ScrapeTimeoutSecs  float64
+    HonorLabels        bool
     ClusterLabel       string
     AdditionalLabels   map[string]string
+}
+```
+
+#### `VectorSources`
+
+The top-level shape of the generated YAML:
+
+```go
+type VectorSources struct {
+    Sources    map[string]SourceConfig    `yaml:"sources"`
+    Transforms map[string]TransformConfig `yaml:"transforms,omitempty"`
+}
+```
+
+#### `SourceConfig`
+
+```go
+type SourceConfig struct {
+    Type               string      `yaml:"type"`               // always "prometheus_scrape"
+    Endpoints          []string    `yaml:"endpoints"`
+    ScrapeIntervalSecs float64     `yaml:"scrape_interval_secs"`
+    ScrapeTimeoutSecs  float64     `yaml:"scrape_timeout_secs"`
+    HonorLabels        bool        `yaml:"honor_labels,omitempty"`
+    Auth               *AuthConfig `yaml:"auth,omitempty"`
+    TLS                *TLSConfig  `yaml:"tls,omitempty"`
+}
+```
+
+#### `AuthConfig`
+
+Flattened internally-tagged enum matching Vector's `auth` schema
+(`{strategy: basic, user, password}` or `{strategy: bearer, token}`).
+
+#### `TLSConfig`
+
+```go
+type TLSConfig struct {
+    VerifyCertificate *bool  `yaml:"verify_certificate,omitempty"`
+    VerifyHostname    *bool  `yaml:"verify_hostname,omitempty"`
+    CAFile            string `yaml:"ca_file,omitempty"`
+    CrtFile           string `yaml:"crt_file,omitempty"`
+    KeyFile           string `yaml:"key_file,omitempty"`
+    ServerName        string `yaml:"server_name,omitempty"`
+}
+```
+
+#### `TransformConfig`
+
+```go
+type TransformConfig struct {
+    Type   string   `yaml:"type"`   // "remap"
+    Inputs []string `yaml:"inputs"`
+    Source string   `yaml:"source"` // VRL
 }
 ```
 
@@ -151,20 +303,15 @@ type Config struct {
 
 #### `Render(targets []discovery.Target, cfg Config) ([]byte, error)`
 
-Generates a Vector config fragment (YAML) from the discovered targets.
-The output contains:
-
-- `sources` — one `prometheus_scrape` source per (scheme, path) group
-- `transforms` — one `remap` transform (`enrich_metrics`) with a VRL
-  lookup table mapping `instance` labels to k8s metadata
-
-When no targets are provided, calls `RenderEmpty()`.
+Generates a Vector config fragment. Groups targets into `prometheus_scrape`
+sources by scheme, path, interval, timeout, TLS, and auth; produces an
+`enrich_metrics` remap transform with a VRL metadata lookup table keyed on
+`instance`. Returns `RenderEmpty` when `targets` is empty.
 
 #### `RenderEmpty(cfg Config) ([]byte, error)`
 
-Produces a minimal valid config with a single `no_targets` source that
-has zero endpoints. Ensures Vector always has a parseable config even
-before any scrape targets are discovered.
+Produces a minimal valid config with one `no_targets` source and zero
+endpoints.
 
 ---
 
@@ -174,7 +321,7 @@ before any scrape targets are discovered.
 import "github.com/sonroyaalmerol/vector-k8s-helper/internal/writer"
 ```
 
-### Types
+### types
 
 #### `Writer`
 
@@ -182,14 +329,29 @@ import "github.com/sonroyaalmerol/vector-k8s-helper/internal/writer"
 type Writer struct { /* unexported fields */ }
 ```
 
-Persists generated Vector config to a Kubernetes ConfigMap.
+Persists rendered Vector config to a Kubernetes ConfigMap.
 
 ##### `NewWriter(client kubernetes.Interface, namespace, configMapKey string, logger *slog.Logger) *Writer`
 
-Creates a Writer targeting the given namespace and ConfigMap data key.
+Creates a Writer for the given namespace and ConfigMap data key.
 
 ##### `(w *Writer) Upsert(ctx context.Context, name string, content []byte) error`
 
-Creates the ConfigMap if it doesn't exist, otherwise patches it using
-strategic merge patch. Returns an error if the namespace is empty or the
-API call fails.
+Creates the ConfigMap if absent, otherwise applies a JSON merge patch. Retries
+on conflict (`409`) and transient network errors with exponential backoff, up
+to three attempts. Returns an error if `namespace` is empty or all attempts
+fail.
+
+---
+
+## `cmd/vector-k8s-helper`
+
+The entrypoint (`main` package). Wires the four stages together:
+
+1. Loads config via `config.Load`.
+2. Builds the in-cluster Kubernetes client.
+3. Starts the health server (`/health`, `204`) on `METRICS_LISTEN_ADDR`.
+4. Starts `Watcher.Run` in a goroutine.
+5. In the main loop, reads snapshots, renders, dedupes bytewise against the
+   previous render, and writes via `Writer.Upsert`.
+6. Shuts down on `SIGINT`/`SIGTERM`.

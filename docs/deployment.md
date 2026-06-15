@@ -2,12 +2,24 @@
 
 ## Manifests
 
-The `deploy/` directory contains all required Kubernetes resources:
+The `deploy/` directory contains everything needed to run the helper and a
+Vector consumer:
 
-| File | Resource | Purpose |
-|---|---|---|
-| `deployment.yaml` | ServiceAccount, ClusterRole, ClusterRoleBinding, Deployment | Runs the helper |
-| `configmap.yaml` | ConfigMap | Initial empty scrape config |
+| File | Contents |
+|---|---|
+| `deploy/deployment.yaml` | ServiceAccount, ClusterRole, ClusterRoleBinding, and the helper Deployment. |
+| `deploy/configmap.yaml` | Initial empty ConfigMap seeded with a valid no-targets config. |
+| `deploy/vector.yaml` | Complete Vector consumer: ServiceAccount, RBAC, main/sinks ConfigMaps, and Deployment. |
+
+Apply the helper first, then Vector:
+
+```bash
+kubectl apply -f deploy/deployment.yaml
+kubectl apply -f deploy/configmap.yaml
+kubectl apply -f deploy/vector.yaml
+```
+
+Or all at once — ordering is only relevant on first apply:
 
 ```bash
 kubectl apply -f deploy/
@@ -15,51 +27,70 @@ kubectl apply -f deploy/
 
 ## RBAC
 
-The helper needs cluster-scope read access to Pods and Services (to discover
-scrape targets across namespaces) and read/write access to the target
-ConfigMap in its own namespace:
+The helper's ClusterRole grants read-only `list`/`watch` on every resource
+type it can discover, plus `get`/`list`/`watch`/`create`/`update`/`patch` on
+ConfigMaps (to write the generated config):
 
 ```yaml
 rules:
   - apiGroups: [""]
-    resources: ["pods", "services"]
-    verbs: ["list", "watch"]         # read-only for discovery
+    resources: ["pods", "services", "nodes", "namespaces"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "create", "update", "patch"]  # write generated config
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ```
 
-> **Note**: ConfigMap access is currently cluster-scoped. To restrict to a
-> single namespace, replace the ClusterRole with a Role and
-> ClusterRoleBinding with a RoleBinding.
+Discovery is cluster-scoped by design — the helper needs to see workloads
+across all namespaces to discover targets. The ConfigMap write permission can
+be narrowed to a single namespace by swapping the ClusterRole/Binding for a
+Role/RoleBinding scoped to the ConfigMap's namespace (see
+[Narrowing ConfigMap permissions](#narrowing-configmap-permissions)).
 
-## Resource Requirements
+The Vector consumer only needs to read the generated ConfigMap, so it ships
+with a namespaced Role + RoleBinding limited to `configmaps` `get`/`list`/`watch`.
 
-The helper is lightweight. Default limits in the Deployment manifest:
+## Resource requirements
+
+The helper is lightweight. Defaults in the Deployment manifest:
 
 | Resource | Request | Limit |
 |---|---|---|
 | CPU | 50m | 200m |
-| Memory | 64Mi | 128Mi |
+| Memory | 64Mi | 256Mi |
 
-These are sufficient for clusters with up to ~5,000 scrape targets. Scale
-memory to 256Mi for larger clusters.
+These handle clusters with several thousand scrape targets. Scale memory
+upward for very large clusters (the target snapshot and rendered YAML are held
+in memory).
 
-## Multi-Environment Patterns
+## Health
 
-### Separate Clusters
+The helper serves `GET /health` on `METRICS_LISTEN_ADDR` (default `:9090`),
+returning `204 No Content`. Wire this into the Deployment as a readiness/liveness
+probe so the pod is only marked ready once the server is up.
 
-Each cluster runs its own helper with a unique `CLUSTER_LABEL`:
+## Multi-environment patterns
+
+### Per-cluster deployment
+
+Each cluster runs its own helper with a distinct `CLUSTER_LABEL`. All metrics
+from that cluster are tagged, making them distinguishable downstream:
 
 ```yaml
-# Production cluster
 env:
   - name: CLUSTER_LABEL
     value: "dmz-prod-1"
   - name: SCRAPE_INTERVAL
     value: "30s"
+```
 
-# Staging cluster
+```yaml
 env:
   - name: CLUSTER_LABEL
     value: "lan-dev-1"
@@ -67,9 +98,10 @@ env:
     value: "15s"
 ```
 
-### Single Cluster, Multiple Namespaces
+### Namespace-scoped discovery
 
-To watch only a specific namespace, set `NAMESPACE`:
+Set `NAMESPACE` to restrict the informers to a single namespace. This lowers
+API server load and limits discovery scope:
 
 ```yaml
 env:
@@ -77,116 +109,144 @@ env:
     value: "monitoring"
 ```
 
-This uses a namespace-scoped informer, reducing API server load and
-limiting discovery to that namespace.
+### Namespace include/exclude
 
-### Namespaced ConfigMap
+For cluster-wide discovery with exclusions, use the allowlist/denylist. The
+allowlist is empty by default (allow all); the denylist is applied after it:
 
-For environments where the helper should only manage ConfigMaps in its
-own namespace, change the RBAC from ClusterRole to Role:
+```yaml
+env:
+  - name: NAMESPACE_EXCLUDE
+    value: "kube-system,kube-public"
+```
+
+```yaml
+env:
+  - name: NAMESPACE_INCLUDE
+    value: "production,staging"
+```
+
+### Role selection
+
+Enable only the roles you need. Most setups need `pod` plus one endpoint role:
+
+```yaml
+env:
+  - name: ROLES
+    value: "pod,endpointslice"
+```
+
+For full parity with a Prometheus `endpoints`-role config:
+
+```yaml
+env:
+  - name: ROLES
+    value: "pod,endpoints"
+```
+
+Enable all six roles for maximum coverage (at the cost of more API traffic):
+
+```yaml
+env:
+  - name: ROLES
+    value: "pod,endpointslice,endpoints,service,node,ingress"
+```
+
+### Narrowing ConfigMap permissions
+
+To restrict ConfigMap writes to the helper's own namespace, replace the
+ClusterRole + ClusterRoleBinding for ConfigMaps with a namespaced pair. Discovery
+resources (pods, services, etc.) still require a ClusterRole:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: vector-k8s-helper
+  name: vector-k8s-helper-configmap
   namespace: kube-system
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "create", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: vector-k8s-helper
+  name: vector-k8s-helper-configmap
   namespace: kube-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: vector-k8s-helper
+  name: vector-k8s-helper-configmap
 subjects:
   - kind: ServiceAccount
     name: vector-k8s-helper
     namespace: kube-system
 ```
 
-Pod and Service watch still require a ClusterRole (the helper must see
-pods and services across namespaces to discover all scrape targets).
+Then remove the `configmaps` entry from the ClusterRole.
 
-## Container Image
+## Container image
 
 ### Build
 
 ```bash
-docker build -t ghcr.io/sonroyaalmerol/vector-k8s-helper:latest .
+docker build -t vector-k8s-helper .
 ```
 
-The Dockerfile uses a two-stage build:
-1. **Builder** — `golang:1.26-bookworm`, compiles a static binary
+The Dockerfile is a two-stage build:
+1. **Builder** — `golang:1.26-bookworm`, produces a static CGO-free binary.
 2. **Runtime** — `gcr.io/distroless/static-debian12:nonroot`, minimal attack
-   surface
+   surface, runs as non-root.
 
-### Multi-Architecture
+### Released images
 
-The CI workflow builds for `linux/amd64` and `linux/arm64`. Push a tag to
-trigger a release:
+The release workflow publishes multi-arch (`linux/amd64`, `linux/arm64`)
+images to GHCR on every tag:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Images are published to `ghcr.io/sonroyaalmerol/vector-k8s-helper`.
+Images land at `ghcr.io/sonroyaalmerol/vector-k8s-helper:<version>`,
+`ghcr.io/sonroyaalmerol/vector-k8s-helper:<major>.<minor>`, and
+`ghcr.io/sonroyaalmerol/vector-k8s-helper:<major>`.
 
-### Custom Registry
+### Private registry
 
-Update the Deployment manifest's `image` field:
+Update the Deployment's `image` field:
 
 ```yaml
 image: your-registry.example.com/vector-k8s-helper:v0.1.0
 ```
 
-## Vector Integration Checklist
+## Vector integration
 
-1. **Deploy** the helper (`kubectl apply -f deploy/`)
-2. **Mount** the ConfigMap in Vector's DaemonSet:
+The sample `deploy/vector.yaml` is a complete consumer. It:
 
-   ```yaml
-   extraVolumes:
-     - name: scrape-config
-       configMap:
-         name: vector-scrape-config
-   extraVolumeMounts:
-     - name: scrape-config
-       mountPath: /etc/vector/scrape_sources.yaml
-       subPath: scrape_sources.yaml
-       readOnly: true
-   ```
+1. Mounts the generated `vector-scrape-config` ConfigMap at
+   `/etc/vector/discovered/`.
+2. Mounts a `vector-main` ConfigMap whose `vector.yaml` includes both the
+   discovered config and the sinks config via `configs:`.
+3. Runs Vector with `--watch-config` so it hot-reloads when the ConfigMap
+   volume syncs.
+4. Pipes `enrich_metrics` (the helper's transform) into a
+   `prometheus_remote_write` sink.
 
-3. **Add** `enrich_metrics` to your metrics sink inputs:
+Point the sink at your remote write endpoint (Mimir, Thanos, Cortex, or any
+Prometheus-remote-write-compatible store):
 
-   ```yaml
-   sinks:
-     vector_metrics:
-       type: vector
-       inputs:
-         - internal_metrics
-         - enrich_metrics
-       address: "nabu.sgl.com:6000"
-   ```
-
-4. **Verify** the ConfigMap is being updated:
-
-   ```bash
-   kubectl get configmap vector-scrape-config -n kube-system -o yaml
-   ```
-
-5. **Verify** Vector has loaded the dynamic config:
-
-   ```bash
-   kubectl exec -n kube-system <vector-pod> -- vector config
-   ```
+```yaml
+sinks:
+  prometheus_remote_write:
+    type: prometheus_remote_write
+    inputs: ["enrich_metrics"]
+    endpoint: "https://mimir.example.com/api/v1/push"
+    tls:
+      verify_certificate: true
+      include_system_ca_certs_pool: true
+```
 
 ## Troubleshooting
 
@@ -196,28 +256,46 @@ image: your-registry.example.com/vector-k8s-helper:v0.1.0
 kubectl logs -n kube-system -l app=vector-k8s-helper -f
 ```
 
-JSON-formatted logs show reconciliation events:
+Logs are JSON. Key events:
 
 ```json
-{"level":"INFO","msg":"targets changed","count":12}
-{"level":"INFO","msg":"updated configmap","namespace":"kube-system","name":"vector-scrape-config","size":1847}
+{"level":"INFO","msg":"configuration loaded","roles":"pod,endpointslice","scrape_interval":"30s"}
+{"level":"INFO","msg":"started kubernetes informers","roles":"pod,endpointslice"}
+{"level":"INFO","msg":"targets changed","count":42}
+{"level":"INFO","msg":"updated configmap","namespace":"kube-system","name":"vector-scrape-config","size":9831}
 ```
 
 ### ConfigMap not updating
 
-- Check RBAC permissions: `kubectl auth can-i patch configmap vector-scrape-config -n kube-system`
-- Check the helper's `NAMESPACE` env var matches the ConfigMap's namespace
-
-### Vector not picking up changes
-
-- Confirm the ConfigMap is mounted: `kubectl exec <vector-pod> -- ls /etc/vector/`
-- Vector watches for file changes via `--watch-config` or `--config-dir`; check
-  that the Vector pod's `args` include `--config-dir /etc/vector/`
-- ConfigMap volume mounts can take up to 60 seconds to sync (kubelet sync
-  interval). This is a K8s limitation, not a Vector limitation.
+- Check RBAC: `kubectl auth can-i patch configmap vector-scrape-config --as=system:serviceaccount:kube-system:vector-k8s-helper -n kube-system`
+- Confirm the helper's `NAMESPACE` env matches the ConfigMap's namespace.
+- Look for `failed to write configmap` errors in the logs (conflict retries
+  are normal transient; persistent failures indicate an RBAC or API issue).
 
 ### No targets discovered
 
-- Verify pod/service annotations: `kubectl get pod <name> -o jsonpath='{.metadata.annotations}'`
+- Verify annotations: `kubectl get pod <name> -o jsonpath='{.metadata.annotations}'`
+  — look for `prometheus.io/scrape: "true"`.
 - Confirm the pod has an IP: `kubectl get pod <name> -o jsonpath='{.status.podIP}'`
-- Check for `vector.dev/exclude: "true"` label
+- Check for `vector.dev/exclude: "true"`.
+- Check namespace filters — `NAMESPACE_INCLUDE` / `NAMESPACE_EXCLUDE` may be
+  hiding the namespace.
+- Check the `ROLES` env — the role matching your workload must be enabled.
+
+### Vector not picking up changes
+
+- Confirm the ConfigMap is mounted:
+  `kubectl exec <vector-pod> -- ls /etc/vector/discovered/`
+- Vector must run with `--watch-config`. The sample manifest includes it.
+- ConfigMap volume mounts sync on the kubelet's relist interval (up to ~60s by
+  default). This is a Kubernetes limitation, not a Vector one.
+
+### Verify the generated config
+
+```bash
+kubectl get configmap vector-scrape-config -n kube-system -o jsonpath='{.data.scrape_sources\.yaml}'
+```
+
+Check that the `sources:` section lists your endpoints and the
+`enrich_metrics` transform's metadata table contains your targets' `instance`
+keys.

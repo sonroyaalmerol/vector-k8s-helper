@@ -1,249 +1,194 @@
 # vector-k8s-helper
 
-A lightweight Kubernetes controller that discovers Pods and Services annotated
-with `prometheus.io/scrape` and dynamically generates Vector
-`prometheus_scrape` source configuration.
+A Kubernetes controller that discovers Prometheus scrape targets and renders
+them into a [Vector](https://vector.dev) `prometheus_scrape` configuration —
+a drop-in replacement for Grafana Alloy's `discovery.kubernetes` when your
+metrics pipeline is Vector, not Prometheus.
 
-It bridges the gap between Kubernetes service discovery (which Vector lacks
-natively) and Vector's static `prometheus_scrape` source by watching the
-K8s API in real time and writing generated config to a ConfigMap that Vector
-hot-reloads.
+It watches the Kubernetes API for annotated workloads, generates a Vector
+config fragment (sources + an enrichment transform), and writes it to a
+ConfigMap that Vector hot-reloads at runtime. No restarts, no sidecars, no
+Prometheus required.
 
-## Features
+## What it does
 
-- **Real-time discovery** — watches Pods and Services via K8s informers,
-  updates config within seconds of changes
-- **Full annotation support** — `prometheus.io/scrape`, `port`, `path`,
-  `scheme`
-- **Pod exclusion** — pods labeled `vector.dev/exclude: "true"` are skipped
-- **Kubernetes label enrichment** — generates a VRL remap transform that
-  adds `namespace`, `pod`, `node`, `service`, and `container` labels to
-  scraped metrics
-- **Cluster label** — optional static `cluster` tag for multi-cluster
-  environments
-- **Zero-downtime updates** — Vector picks up ConfigMap changes via
-  `--watch-config`; no pod restarts required
-- **Single binary, minimal footprint** — < 64 MiB memory, no dependencies
-  beyond the K8s API
+- Discovers scrape targets across **six roles**: `pod`, `endpointslice`,
+  `endpoints`, `service`, `node`, and `ingress` — the same role set as
+  Prometheus `k8s_sd_configs` / Alloy `discovery.kubernetes`.
+- Reads the standard `prometheus.io/*` annotations (configurable prefix) for
+  scrape enablement, port, path, scheme, interval, TLS, and auth.
+- Emits the full `__meta_kubernetes_*` metadata surface (pod phase, endpoint
+  zone, service type, node addresses, controller info, label/annotation
+  presence flags, etc.) as Vector tags via a generated VRL lookup table keyed
+  on `instance`.
+- Groups targets into the minimum number of `prometheus_scrape` sources
+  (one per scheme + path + TLS + auth combination).
+- Deduplicates writes with a content hash so the ConfigMap is only patched
+  when something actually changes.
 
-## How It Works
-
-```
- Kubernetes API            vector-k8s-helper               ConfigMap               Vector Agent
-┌──────────────┐      ┌─────────────────────┐      ┌──────────────────┐      ┌───────────────┐
-│  Pods         │─────►│  Informers watch     │      │  scrape_sources  │◄────│  --config-dir  │
-│  Services    │      │  annotation changes │─────►│  .yaml           │      │  /etc/vector/  │
-│              │      │  → render YAML      │      │  (auto-updated)  │      │               │
-└──────────────┘      └─────────────────────┘      └──────────────────┘      └───────────────┘
-```
-
-1. Informers watch all Pods and Services (or a single namespace) for
-   `prometheus.io/scrape: "true"`
-2. On any change, the full target set is reconciled and rendered into a
-   Vector config fragment containing:
-   - `prometheus_scrape` sources grouped by scheme and path
-   - A `remap` transform (`enrich_metrics`) with a VRL lookup table that
-     enriches each metric with Kubernetes metadata
-3. The fragment is written to the `vector-scrape-config` ConfigMap via
-   strategic merge patch
-4. Vector's `--config-dir /etc/vector/` picks up the mounted ConfigMap
-   file and reloads
-
-## Supported Annotations
-
-| Annotation | Default | Description |
-|---|---|---|
-| `prometheus.io/scrape` | `false` | Enable scraping for this pod/service |
-| `prometheus.io/port` | first container/svc port | Port number to scrape |
-| `prometheus.io/path` | `/metrics` | HTTP path to scrape |
-| `prometheus.io/scheme` | `http` | URL scheme (`http` or `https`) |
-| `vector.dev/exclude` | — | Set to `"true"` on a pod to exclude it |
-
-## Quick Start
-
-### Deploy the Helper
+## Quick start
 
 ```bash
+# build and push (or use a released image)
+docker build -t vector-k8s-helper .
+
+# deploy the helper + Vector consumer
 kubectl apply -f deploy/
+
+# annotate a workload to expose metrics
+kubectl annotate pod myapp prometheus.io/scrape=true prometheus.io/port=9090
 ```
 
-This creates:
-- A `ServiceAccount` and `ClusterRole` with pod/service read and configmap
-  read/write permissions
-- A `Deployment` running `vector-k8s-helper` in `kube-system`
-- An initial `ConfigMap` (`vector-scrape-config`) with an empty scrape config
+The helper writes its generated config to the `vector-scrape-config` ConfigMap.
+Vector mounts that ConfigMap and reloads automatically.
 
-### Configure Vector
+## How it works
 
-Add the following to your Vector Helm values to mount the generated config
-and route metrics:
+The helper runs a single reconciler loop driven by Kubernetes informers:
 
-```yaml
-extraVolumes:
-  - name: scrape-config
-    configMap:
-      name: vector-scrape-config
+1. **Watch** — per-role ListWatch informers (with optional label/field
+   selectors) stream add/update/delete events from the API server.
+2. **Debounce** — events are coalesced by a configurable debounce window so a
+   burst of pod churn produces one reconcile, not fifty.
+3. **Reconcile** — on each tick the helper walks every informer store,
+   resolves targets from each enabled role, and builds a deduplicated snapshot
+   keyed by target name.
+4. **Render** — the snapshot is grouped into `prometheus_scrape` sources and a
+   VRL `remap` transform (`enrich_metrics`) that attaches Kubernetes metadata
+   as tags.
+5. **Write** — the rendered YAML is upserted into the target ConfigMap via a
+   JSON merge patch, with conflict retries and content-hash dedup.
 
-extraVolumeMounts:
-  - name: scrape-config
-    mountPath: /etc/vector/scrape_sources.yaml
-    subPath: scrape_sources.yaml
-    readOnly: true
+Vector reads the ConfigMap from a mounted volume. With `--watch-config`, it
+hot-reloads whenever the kubelet syncs the updated volume (typically under a
+minute).
 
-customConfig:
-  data_dir: /vector-data-dir
-
-  sources:
-    kubernetes_logs:
-      type: "kubernetes_logs"
-    internal_metrics:
-      type: "internal_metrics"
-
-  sinks:
-    vector_logs:
-      type: "vector"
-      inputs: ["kubernetes_logs"]
-      address: "nabu.sgl.com:6000"
-
-    vector_metrics:
-      type: "vector"
-      inputs:
-        - "internal_metrics"
-        - "enrich_metrics"    # ← from the generated config
-      address: "nabu.sgl.com:6000"
-```
-
-Vector's default `--config-dir /etc/vector/` will discover and merge
-`scrape_sources.yaml` automatically.
-
-### Annotate Your Workloads
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: myapp
-  annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "9090"
-    prometheus.io/path: "/metrics"
-spec:
-  ports:
-    - port: 9090
-```
-
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: myapp
-  annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "8080"
-spec:
-  containers:
-    - name: app
-      image: myapp:latest
-```
+See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ## Configuration
 
-All configuration is via environment variables:
+All configuration is via environment variables.
+
+### Core
 
 | Variable | Default | Description |
 |---|---|---|
-| `NAMESPACE` | `""` (all) | K8s namespace to watch; empty = all namespaces |
-| `CONFIGMAP_NAME` | `vector-scrape-config` | Target ConfigMap name |
-| `CONFIGMAP_KEY` | `scrape_sources.yaml` | Data key inside the ConfigMap |
-| `SCRAPE_INTERVAL` | `30s` | Prometheus scrape interval (minimum 5s) |
-| `RESYNC_INTERVAL` | `5m` | Informer full resync interval |
-| `CLUSTER_LABEL` | `""` | Static cluster label added to all metrics |
-| `ADDITIONAL_LABELS` | `""` | Extra labels as `key1=val1,key2=val2` |
-| `METRICS_LISTEN_ADDR` | `:9090` | Health/metrics listen address |
+| `NAMESPACE` | `""` (all namespaces) | Namespace to watch. Empty = cluster-wide. |
+| `CONFIGMAP_NAME` | `vector-scrape-config` | ConfigMap the rendered config is written to. |
+| `CONFIGMAP_KEY` | `scrape_sources.yaml` | Data key inside the ConfigMap. |
+| `SCRAPE_INTERVAL` | `30s` | Default scrape interval applied to every source. |
+| `SCRAPE_TIMEOUT` | `10s` | Default scrape timeout. Overridable per-target. |
+| `HONOR_LABELS` | `false` | Passed through to `prometheus_scrape.honor_labels`. |
+| `RESYNC_INTERVAL` | `5m` | Informer full-resync interval. |
+| `DEBOUNCE_INTERVAL` | `250ms` | Coalescing window for reconcile triggers. |
+| `METRICS_LISTEN_ADDR` | `:9090` | Health/readiness server listen address. |
+| `CLUSTER_LABEL` | `""` | Static cluster tag attached to every metric (e.g. `dmz-prod-1`). |
+| `ADDITIONAL_LABELS` | `""` | Extra static tags (`k1=v1,k2=v2`). |
+| `ANNOTATION_PREFIX` | `prometheus.io` | Annotation prefix. Change for non-default namespaces. |
 
-### Cluster Labels
+### Discovery
 
-For multi-cluster setups, set `CLUSTER_LABEL` per environment:
+| Variable | Default | Description |
+|---|---|---|
+| `ROLES` | `pod,endpointslice` | Comma-separated roles to enable. One or more of: `pod`, `endpointslice`, `endpoints`, `service`, `node`, `ingress`. |
+| `NAMESPACE_INCLUDE` | `""` (allow all) | Comma-separated namespace allowlist. |
+| `NAMESPACE_EXCLUDE` | `""` | Comma-separated namespace denylist. Evaluated after the allowlist. |
+| `INCLUDE_LABELS` | `true` | Attach discovered object labels as `label_*` tags. |
+| `INCLUDE_ANNOTATIONS` | `false` | Attach discovered object annotations as `annotation_*` tags. |
+| `ATTACH_NODE_METADATA` | `false` | Attach node name/IP to pod targets. |
+| `ATTACH_NAMESPACE_METADATA` | `false` | Attach namespace labels as `namespace_label_*` tags. |
+| `NODE_SCRAPE_PORT` | `10250` | Port used for `node` role targets. |
+| `SERVICE_DNS_SUFFIX` | `svc.cluster.local` | DNS suffix for `service` role targets. |
 
-```yaml
-# Production
-env:
-  - name: CLUSTER_LABEL
-    value: "dmz-prod-1"
+### Selectors
 
-# Staging
-env:
-  - name: CLUSTER_LABEL
-    value: "lan-dev-1"
-```
+Each role supports an optional label and field selector, applied at the
+informer level so unmatched objects never enter the store:
 
-## Generated Config Example
+| Variable | Applies to |
+|---|---|
+| `POD_LABEL_SELECTOR` / `POD_FIELD_SELECTOR` | `pod` |
+| `SERVICE_LABEL_SELECTOR` / `SERVICE_FIELD_SELECTOR` | `service` |
+| `ENDPOINTSLICE_LABEL_SELECTOR` / `ENDPOINTSLICE_FIELD_SELECTOR` | `endpointslice` |
+| `ENDPOINTS_LABEL_SELECTOR` / `ENDPOINTS_FIELD_SELECTOR` | `endpoints` |
+| `NODE_LABEL_SELECTOR` / `NODE_FIELD_SELECTOR` | `node` |
+| `INGRESS_LABEL_SELECTOR` / `INGRESS_FIELD_SELECTOR` | `ingress` |
 
-When two pods and one service are discovered, the helper generates a
-ConfigMap entry like:
+## Scrape annotations
 
-```yaml
-sources:
-  k8s_metrics_http_metrics:
-    type: prometheus_scrape
-    endpoints:
-      - http://10.0.0.5:9090/metrics
-      - http://10.0.0.10:8080/metrics
-      - http://10.96.0.50:9090/metrics
-    scrape_interval_secs: 30
+The helper reads the standard Prometheus annotations under the configured
+prefix (default `prometheus.io`):
 
-transforms:
-  enrich_metrics:
-    type: remap
-    inputs:
-      - k8s_metrics_http_metrics
-    source: |
-      # Auto-generated Kubernetes metadata enrichment.
-      metadata = {
-        "10.0.0.5:9090": {"namespace": "production", "pod": "myapp-abc123", "node": "node-1", "container": "app"},
-        "10.96.0.50:9090": {"namespace": "production", "service": "myapp"},
-      }
+| Annotation | Applies to | Description |
+|---|---|---|
+| `prometheus.io/scrape` | pod, service | Enables scraping (`true`/`false`). |
+| `prometheus.io/port` | pod, service | Target port (numeric). Overrides declared port. |
+| `prometheus.io/path` | pod, service | Metrics path (default `/metrics`). |
+| `prometheus.io/scheme` | pod, service | `http` or `https` (default `http`). |
+| `prometheus.io/params` | pod, service | Query string appended to the URL. |
+| `prometheus.io/job` | pod, service | Overrides the `job` tag. |
+| `prometheus.io/collectionInterval` | pod, service | Per-target scrape interval (Go duration). |
+| `prometheus.io/collectionTimeout` | pod, service | Per-target scrape timeout (Go duration). |
+| `prometheus.io/tlsServerName` | pod, service | TLS server name (SNI). |
+| `prometheus.io/tlsInsecureSkipVerify` | pod, service | Disable TLS verification (`true`). |
+| `prometheus.io/tlsCAFile` | pod, service | Path to a CA bundle. |
+| `prometheus.io/tlsCertFile` | pod, service | Path to a client cert. |
+| `prometheus.io/tlsKeyFile` | pod, service | Path to a client key. |
+| `prometheus.io/httpBasicAuthUsernameEnvVar` | pod, service | Env var holding the basic-auth username. |
+| `prometheus.io/httpBasicAuthPasswordEnvVar` | pod, service | Env var holding the basic-auth password. |
+| `prometheus.io/httpBearerTokenEnvVar` | pod, service | Env var holding a bearer token. |
+| `prometheus.io/serviceAccountBearerToken` | service | Use the service account token. |
+| `vector.dev/exclude` | all | Exclude the object from discovery (`true`). |
 
-      inst = .tags.instance
-      if inst != null && metadata[inst] != null {
-        .tags.namespace = metadata[inst].namespace
-        .tags.pod = metadata[inst].pod
-        .tags.node = metadata[inst].node
-        .tags.service = metadata[inst].service
-        .tags.container = metadata[inst].container
-      }
-      .tags.cluster = "dmz-prod-1"
-```
+## Metadata tags
+
+Every discovered target carries role-specific metadata that the generated VRL
+transform attaches as Vector tags. This mirrors the Prometheus
+`__meta_kubernetes_*` label set.
+
+| Tag | Roles | Source |
+|---|---|---|
+| `namespace` | all | object namespace |
+| `pod` | pod, endpointslice, endpoints | pod name |
+| `service` | endpointslice, endpoints, service, ingress | service name |
+| `node` | pod, node | node name |
+| `container` | pod | container name |
+| `job` | all | job label (annotation or derived) |
+| `pod_uid`, `pod_phase`, `pod_ready` | pod | pod status |
+| `controller_kind`, `controller_name` | pod | owner reference |
+| `container_image`, `container_id`, `container_init` | pod | container spec/status |
+| `host_ip`, `pod_ip`, `node_ip` | pod, node | IPs |
+| `port_name`, `port_number`, `port_protocol` | pod, endpointslice, endpoints | resolved port |
+| `service_port_name`, `service_type`, `service_cluster_ip`, `service_external_name` | endpointslice, endpoints, service | service spec |
+| `node_provider_id`, `node_address_*` | node | node status |
+| `endpoint_ready`, `endpoint_hostname`, `endpoint_node_name`, `endpoint_zone`, `endpoint_address_type`, `endpointslice_name` | endpointslice, endpoints | endpoint |
+| `ingress_class_name`, `ingress_path`, `ingress_scheme` | ingress | ingress spec |
+| `label_*`, `labelpresent_*` | all (when `INCLUDE_LABELS`) | object labels |
+| `annotation_*`, `annotationpresent_*` | all (when `INCLUDE_ANNOTATIONS`) | object annotations |
+
+## Deployment
+
+The `deploy/` directory contains ready-to-apply manifests:
+
+| File | Contents |
+|---|---|
+| `deploy/deployment.yaml` | ServiceAccount, ClusterRole, ClusterRoleBinding, and the helper Deployment. |
+| `deploy/configmap.yaml` | Initial empty ConfigMap (seeded with a valid no-targets config). |
+| `deploy/vector.yaml` | A complete Vector consumer: ServiceAccount, RBAC, main/sinks ConfigMaps, and Deployment. |
+
+See [docs/deployment.md](docs/deployment.md) for the full guide, including
+RBAC, multi-cluster patterns, and troubleshooting.
 
 ## Development
 
 ```bash
-# Build
+go test -race ./...          # run tests with the race detector
+go vet ./...                 # static analysis
+golangci-lint run            # lint (config in .golangci.yml / v2)
 go build ./cmd/vector-k8s-helper
-
-# Test
-go test ./... -race
-
-# Lint
-golangci-lint run ./...
-
-# Docker
-docker build -t vector-k8s-helper .
 ```
 
-## Architecture
-
-See [docs/architecture.md](docs/architecture.md) for the component diagram
-and data flow details.
-
-## API Reference
-
-See [docs/api.md](docs/api.md) for the full internal package documentation.
-
-## Deployment Reference
-
-See [docs/deployment.md](docs/deployment.md) for RBAC details,
-resource requirements, and multi-environment patterns.
+Requires Go 1.26+ (see `go.mod`).
 
 ## License
 

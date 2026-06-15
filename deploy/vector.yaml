@@ -36,9 +36,6 @@ metadata:
 data:
   vector.yaml: |
     data_dir: /var/lib/vector
-    configs:
-      - /etc/vector/discovered/scrape_sources.yaml
-      - /etc/vector/sinks/main.yaml
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -47,11 +44,27 @@ metadata:
   namespace: kube-system
 data:
   main.yaml: |
+    sources:
+      internal_metrics:
+        type: internal_metrics
+        scrape_interval_secs: 30
+        collect_histograms: true
+
+    transforms:
+      tag_internal:
+        type: remap
+        inputs: ["internal_metrics"]
+        source: |
+          .tags.cluster = "${VECTOR_CLUSTER:-unknown}"
+
     sinks:
       prometheus_remote_write:
         type: prometheus_remote_write
-        inputs: ["enrich_metrics"]
-        endpoint: "http://prometheus:9090/api/v1/write"---
+        inputs: ["enrich_metrics", "tag_internal"]
+        endpoint: "https://mimir.example.com/api/v1/push"
+        healthcheck:
+          enabled: false
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -76,18 +89,28 @@ spec:
           args:
             - --config
             - /etc/vector/main.yaml
+            - --config
+            - /etc/vector/sinks/main.yaml
+            - --config-dir
+            - /etc/vector/discovered
             - --watch-config
           env:
             - name: VECTOR_LOG
               value: "info=warn,warn=info"
+            - name: VECTOR_CLUSTER
+              value: "dmz-prod-1"
           volumeMounts:
             - name: main
               mountPath: /etc/vector/main.yaml
               subPath: vector.yaml
+              readOnly: true
+            - name: sinks
+              mountPath: /etc/vector/sinks/main.yaml
+              subPath: main.yaml
+              readOnly: true
             - name: discovered
               mountPath: /etc/vector/discovered
-            - name: sinks
-              mountPath: /etc/vector/sinks
+              readOnly: true
           resources:
             requests:
               cpu: 100m

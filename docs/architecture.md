@@ -1,160 +1,209 @@
 # Architecture
 
-## Component Diagram
+## Overview
 
+`vector-k8s-helper` is a single-process Kubernetes controller that turns
+Prometheus-style scrape annotations into a live Vector `prometheus_scrape`
+configuration. It replaces the discovery half of Alloy's
+`discovery.kubernetes` + `prometheus.scrape` pipeline, leaving Vector to do
+the actual scraping and remote write.
+
+The controller has four internal stages: **discovery**, **reconcile**,
+**render**, and **write**. Each runs in the same process and communicates
+through in-memory channels.
+
+## Components
+
+### discovery (`internal/discovery`)
+
+The `Watcher` owns one Kubernetes informer per enabled discovery role. Each
+informer is a ListWatch built from the API server with an optional label and
+field selector, so objects that can never match are filtered at the source
+rather than in the reconciler.
+
+Supported roles:
+
+- **pod** — `corev1.Pod`. One target per resolved container port. Reads pod
+  annotations for port, path, scheme, interval, TLS, and auth.
+- **endpointslice** — `discoveryv1.EndpointSlice`. One target per endpoint
+  address × resolved port. Backed by its owning Service for annotations and
+  port resolution. Endpoint ready state, zone, hostname, and node name are
+  emitted as metadata (not used to filter — all endpoints are scraped, matching
+  Prometheus semantics).
+- **endpoints** — `corev1.Endpoints` (legacy). Same target model as
+  EndpointSlice. Honors the owning Service's `prometheus.io/port` annotation,
+  selecting the matching subset port or synthesizing one.
+- **service** — `corev1.Service`. Scrapes the service's ClusterIP (or
+  ExternalName / DNS name). Reads service annotations.
+- **node** — `corev1.Node`. Scrapes the node's primary address at
+  `NODE_SCRAPE_PORT`.
+- **ingress** — `networkingv1.Ingress`. One target per host × path, using the
+  ingress scheme and the default backend.
+
+Every informer event (add, update, delete) signals a single debounce timer.
+When the timer fires — after `DEBOUNCE_INTERVAL` of quiescence — the reconciler
+runs once, regardless of how many events arrived.
+
+### reconcile (`Watcher.reconcile`)
+
+On each run the reconciler iterates every informer store, calls the
+role-specific target extractor, and collects results into a map keyed by target
+name. Keying by name means the same workload discovered through two roles
+(for example, a service seen via both `endpoints` and `endpointslice`) collapses
+to a single target instead of producing duplicates.
+
+Namespace filtering is applied here: `NAMESPACE_INCLUDE` acts as an allowlist
+(empty = allow all), `NAMESPACE_EXCLUDE` as a denylist, evaluated in that order.
+
+The snapshot is emitted on a buffered output channel (capacity 1). If the
+consumer is slow, the latest snapshot replaces the pending one — the helper
+never blocks on rendering and never serves stale configs.
+
+### render (`internal/renderer`)
+
+`Render` converts a `[]Target` snapshot into a Vector YAML fragment.
+
+**Source grouping.** Targets that share scheme, path, scrape interval, scrape
+timeout, TLS, and auth settings are merged into one `prometheus_scrape` source.
+A cluster with a thousand pods all exposing `http://:9090/metrics` produces a
+single source with a thousand endpoints.
+
+**Enrichment transform.** A `remap` transform named `enrich_metrics` is
+generated. It embeds a VRL lookup table that maps each `instance`
+(`host:port`) to its full Kubernetes metadata. Vector's `prometheus_scrape`
+sets `instance` to the endpoint's `host:port` automatically, so the lookup key
+is always present. The transform copies metadata fields onto `.tags`, merges
+object labels, and injects the static `cluster` and additional labels.
+
+**Empty state.** When no targets are discovered, `RenderEmpty` emits a single
+`no_targets` source with a zero-length endpoint list so the config always
+parses.
+
+### write (`internal/writer`)
+
+`Writer.Upsert` creates the ConfigMap if it does not exist, otherwise applies a
+JSON merge patch to its `data` key. Writes are retried on conflict
+(`409`) and transient network errors with exponential backoff, up to three
+attempts.
+
+The caller (main loop) compares each rendered blob to the previous one bytewise
+and skips the write entirely when nothing changed, avoiding needless API server
+load and ConfigMap version churn.
+
+## Target resolution rules
+
+### Pod targets
+
+A pod is scraped when:
+
+- `prometheus.io/scrape` is `"true"` (or truthy), and
+- the pod has a `podIP`, and
+- it is not excluded via `vector.dev/exclude: "true"`.
+
+Port resolution, in priority order:
+
+1. `prometheus.io/port` (numeric) — produces a single target at that port.
+2. The first declared container port that matches — used for name/protocol
+   enrichment.
+3. A port-less target if no port can be determined.
+
+Scheme, path, params, interval, timeout, TLS, and auth are read from the pod
+annotations with the standard defaults.
+
+### Endpoint targets (endpointslice + endpoints)
+
+A service's endpoints are scraped when the owning Service has
+`prometheus.io/scrape: "true"`. Port resolution mirrors pods: the Service's
+`prometheus.io/port` annotation selects a single subset port; otherwise every
+subset port produces a target.
+
+All endpoint addresses are emitted regardless of ready state — ready/not-ready
+is metadata (`endpoint_ready`), not a filter. This matches Prometheus
+`k8s_sd_configs` behavior.
+
+### Service targets
+
+Scrapes the Service directly. Uses `ClusterIP` for ClusterIP/NodePort/LoadBalancer
+services, `ExternalName` for ExternalName services, and the
+`SERVICE_DNS_SUFFIX` DNS name otherwise.
+
+### Node targets
+
+Uses the node's primary internal address at `NODE_SCRAPE_PORT` (default
+`10250`, the kubelet secure port). Enabled via the `node` role.
+
+### Ingress targets
+
+One target per ingress host × path, using the ingress-defined scheme and the
+default backend path. The `ingress` role is for ingresses that terminate TLS
+and proxy to a metrics endpoint.
+
+## Metadata model
+
+Each target carries a flat set of string fields (the `Target` struct). The
+renderer writes these into the VRL lookup table and the transform copies them
+onto `.tags`. Roles that do not produce a field leave it empty, and empty
+fields are omitted from the table.
+
+Label and annotation maps are controlled by `INCLUDE_LABELS` (on by default)
+and `INCLUDE_ANNOTATIONS`. For each key `k` the renderer emits `label_k`
+(or `annotation_k`) with the value, plus a `labelpresent_k` (or
+`annotationpresent_k`) companion — the latter supports relabel-style
+keep/drop-on-presence rules downstream.
+
+## Lifecycle
+
+1. `config.Load` reads env vars and validates them.
+2. `main` builds the in-cluster Kubernetes client.
+3. A goroutine starts the health server on `METRICS_LISTEN_ADDR` (serves
+   `/health`, returns `204`).
+4. `Watcher.Run` starts the role informers, waits for cache sync, then blocks
+   until the context is cancelled.
+5. The main loop reads snapshots from `Watcher.Output`, renders, dedupes, and
+   writes.
+6. `SIGTERM`/`SIGINT` cancels the context; informers and the health server shut
+   down gracefully.
+
+## Generated config shape
+
+```yaml
+sources:
+  k8s_metrics_http_metrics:
+    type: prometheus_scrape
+    endpoints:
+      - http://10.0.1.5:9090/metrics
+      - http://10.0.1.6:9090/metrics
+    scrape_interval_secs: 30
+    scrape_timeout_secs: 10
+
+transforms:
+  enrich_metrics:
+    type: remap
+    inputs: ["k8s_metrics_http_metrics"]
+    source: |
+      metadata = {
+        "10.0.1.5:9090": {"namespace": "default", "pod": "app-0", "node": "node-a", "labels": {...}},
+        "10.0.1.6:9090": {"namespace": "default", "pod": "app-1", "node": "node-b", "labels": {...}},
+      }
+
+      inst = .tags.instance
+      m = metadata[inst]
+      if m != null {
+        .tags.namespace = m.namespace
+        .tags.pod = m.pod
+        # ...all metadata fields...
+        .tags = merge(.tags, m.labels)
+      }
+      .tags.cluster = "dmz-prod-1"
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                     vector-k8s-helper Pod                      │
-│                                                               │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
-│  │  discovery    │  │  renderer    │  │  writer      │         │
-│  │              │  │              │  │              │         │
-│  │  Pod informer│  │  Target[] →  │  │  YAML →      │         │
-│  │  Svc informer├─►│  Vector YAML ├─►│  ConfigMap   │         │
-│  │              │  │  (sources +  │  │  (upsert)    │         │
-│  │  Store cache │  │   transform) │  │              │         │
-│  └──────┬───────┘  └──────────────┘  └──────┬───────┘         │
-│         │                                   │                 │
-│    watch K8s API                    write ConfigMap           │
-└─────────┼───────────────────────────────────┼─────────────────┘
-          │                                   │
-          ▼                                   ▼
-┌──────────────────┐              ┌────────────────────────────┐
-│  Kubernetes API   │              │  ConfigMap                  │
-│  Server           │              │  vector-scrape-config       │
-│                   │              │  ┌───────────────────────┐ │
-│  pods             │              │  │ scrape_sources.yaml   │ │
-│  services         │              │  │  sources:             │ │
-│                   │              │  │  transforms:          │ │
-└──────────────────┘              │  └───────────────────────┘ │
-                                  └────────────┬───────────────┘
-                                               │ mount
-                                               ▼
-                                  ┌────────────────────────────┐
-                                  │  Vector Agent DaemonSet     │
-                                  │  /etc/vector/               │
-                                  │  ├── vector.yaml (main)     │
-                                  │  └── scrape_sources.yaml    │
-                                  │         (dynamic, mounted)  │
-                                  └────────────────────────────┘
-```
 
-## Data Flow
+## Graceful degradation
 
-1. **Watch** — `discovery.Watcher` starts K8s SharedInformerFactory with
-   Pod and Service informers. Event handlers trigger `reconcile()` on every
-   add/update/delete.
-
-2. **Reconcile** — Reads all objects from the informer store, extracts
-   targets from annotated pods/services, deduplicates by name, and emits
-   the full target snapshot on the output channel.
-
-3. **Render** — `renderer.Render()` groups targets by `(scheme, path)` to
-   minimize the number of `prometheus_scrape` sources. For each group it
-   creates a source with the full endpoint URLs. It also generates a
-   `remap` transform (`enrich_metrics`) that uses a VRL lookup table
-   keyed by `instance` (host:port) to enrich metrics with k8s labels.
-
-4. **Write** — `writer.Upsert()` creates or patches the ConfigMap using
-   strategic merge patch. A content hash comparison prevents unnecessary
-   writes when the config hasn't changed.
-
-5. **Reload** — Vector's `--config-dir /etc/vector/` watches for file
-   changes. When kubelet syncs the updated ConfigMap volume, Vector
-   detects the change and hot-reloads the config.
-
-## Target Resolution
-
-### Pod Targets
-
-For each container in an annotated pod:
-
-```
-pod.annotations["prometheus.io/scrape"] == "true"
-  AND pod.status.podIP != ""
-  AND NOT pod.annotations["vector.dev/exclude"] == "true"
-```
-
-The scrape URL is built as:
-
-```
-scheme://<podIP>:<port><path>
-```
-
-Where:
-- `scheme` = `prometheus.io/scheme` annotation (default: `http`)
-- `port` = `prometheus.io/port` annotation, or first `containerPort`
-- `path` = `prometheus.io/path` annotation (default: `/metrics`)
-
-Each container in a multi-container pod produces a separate target.
-
-### Service Targets
-
-For annotated services with a ClusterIP:
-
-```
-service.annotations["prometheus.io/scrape"] == "true"
-  AND service.spec.clusterIP not in ("", "None")
-```
-
-The scrape URL is built as:
-
-```
-scheme://<clusterIP>:<port><path>
-```
-
-Where:
-- `port` = `prometheus.io/port` annotation, or first service port
-- `path` = `prometheus.io/path` annotation (default: `/metrics`)
-
-### Name Sanitization
-
-Target names are derived from the K8s resource identity and sanitized
-for Vector component name compatibility (dots, dashes, slashes →
-underscores):
-
-- Pod: `pod_<namespace>_<name>_<container>` → `pod_kube_system_coredns_app`
-- Service: `svc_<namespace>_<name>` → `svc_production_myapp`
-
-### Source Grouping
-
-Targets sharing the same scheme and metrics path are grouped into a
-single `prometheus_scrape` source to minimize config size:
-
-```
-k8s_metrics_http_metrics     ← all http + /metrics targets
-k8s_metrics_https_metrics     ← all https + /metrics targets
-k8s_metrics_http_custom_path  ← http + /custom/path targets
-```
-
-## Label Enrichment
-
-The generated VRL remap transform uses an instance-based lookup table:
-
-```vrl
-metadata = {
-  "10.0.0.5:9090": {"namespace": "production", "pod": "myapp-abc", "node": "node-1", "container": "app"},
-  "10.96.0.50:9090": {"namespace": "production", "service": "myapp"},
-}
-
-inst = .tags.instance
-if inst != null && metadata[inst] != null {
-  .tags.namespace = metadata[inst].namespace
-  .tags.pod = metadata[inst].pod
-  .tags.node = metadata[inst].node
-  .tags.service = metadata[inst].service
-  .tags.container = metadata[inst].container
-}
-.tags.cluster = "dmz-prod-1"
-```
-
-The `instance` label is set automatically by Vector's `prometheus_scrape`
-source from the endpoint URL's `host:port`, providing the lookup key.
-
-## Graceful Degradation
-
-- **No targets discovered** → an empty `no_targets` source with zero
-  endpoints is generated so the config remains valid
-- **ConfigMap doesn't exist** → created on first write
-- **ConfigMap already exists** → updated via strategic merge patch
-- **Content unchanged** → write is skipped (dedup via string comparison)
+- **No targets** — a valid `no_targets` source is written; Vector never holds
+  an invalid config.
+- **ConfigMap missing** — created on the first write.
+- **ConfigMap present** — patched via JSON merge patch with conflict retries.
+- **Unchanged config** — write skipped via byte comparison.
+- **API server churn** — debounce coalesces event bursts into one reconcile.
+- **Role misconfiguration** — if no roles are enabled, `Watcher.Run` returns an
+  error at startup.
