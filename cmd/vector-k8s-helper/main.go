@@ -1,4 +1,3 @@
-// Package main is the entrypoint for vector-k8s-helper.
 package main
 
 import (
@@ -37,10 +36,15 @@ func main() {
 	logger.Info("configuration loaded",
 		"namespace", cfg.Namespace,
 		"configmap", cfg.ConfigMapName,
+		"roles", cfg.Roles.String(),
 		"scrape_interval", cfg.ScrapeInterval,
 		"scrape_timeout", cfg.ScrapeTimeout,
 		"cluster_label", cfg.ClusterLabel,
 		"honor_labels", cfg.HonorLabels,
+		"attach_node_metadata", cfg.AttachNodeMetadata,
+		"attach_namespace_metadata", cfg.AttachNsMetadata,
+		"include_labels", cfg.IncludeLabels,
+		"include_annotations", cfg.IncludeAnnotations,
 	)
 
 	k8sCfg, err := rest.InClusterConfig()
@@ -58,7 +62,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Start health/metrics server.
 	go serveHealth(ctx, cfg.MetricsAddr, logger)
 
 	w := discovery.NewWatcher(client, cfg, logger)
@@ -105,9 +108,6 @@ func main() {
 	logger.Info("shutting down")
 }
 
-// serveHealth starts a simple HTTP server for health checks.
-// The /health endpoint responds with 200 OK, allowing the helper
-// pod to be annotated with prometheus.io/scrape for self-monitoring.
 func serveHealth(ctx context.Context, addr string, logger *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -129,7 +129,6 @@ func serveHealth(ctx context.Context, addr string, logger *slog.Logger) {
 	}
 }
 
-// buildVersion is set at build time via -ldflags.
 var buildVersion = "dev"
 
 func init() {

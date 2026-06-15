@@ -1,14 +1,13 @@
-// Package config handles application configuration loading and validation.
 package config
 
 import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// Config holds all application configuration.
 type Config struct {
 	Namespace        string
 	ConfigMapName    string
@@ -17,53 +16,71 @@ type Config struct {
 	ScrapeTimeout    time.Duration
 	HonorLabels      bool
 	ResyncInterval   time.Duration
+	DebounceInterval time.Duration
 	MetricsAddr      string
 	ClusterLabel     string
 	AdditionalLabels map[string]string
 	AnnotationPrefix string
+
+	Roles              Roles
+	Selectors          Selectors
+	AttachNodeMetadata bool
+	AttachNsMetadata   bool
+	IncludeAnnotations bool
+	IncludeLabels      bool
+	NodeScrapePort     int32
+	ServiceDNSSuffix   string
 }
 
-// TargetLabel is the standard Prometheus annotation for enabling scrape.
-const TargetLabel = "prometheus.io/scrape"
+type Roles struct {
+	Pod            bool
+	EndpointSlice  bool
+	Node           bool
+	Ingress        bool
+	ServiceAddress bool
+}
 
-// Prometheus annotation keys.
+type Selectors struct {
+	PodLabel           string
+	PodField           string
+	ServiceLabel       string
+	ServiceField       string
+	NodeLabel          string
+	NodeField          string
+	IngressLabel       string
+	IngressField       string
+	EndpointSliceLabel string
+	EndpointSliceField string
+}
+
 const (
-	AnnotationScrape = "scrape"
-	AnnotationPort   = "port"
-	AnnotationPath   = "path"
-	AnnotationScheme = "scheme"
+	AnnotationScrape                    = "scrape"
+	AnnotationPort                      = "port"
+	AnnotationPath                      = "path"
+	AnnotationScheme                    = "scheme"
+	AnnotationParams                    = "params"
+	AnnotationJob                       = "job"
+	AnnotationCollectionInterval        = "collectionInterval"
+	AnnotationCollectionTimeout         = "collectionTimeout"
+	AnnotationServiceAccountBearerToken = "serviceAccountBearerToken"
+	AnnotationTLSServerName             = "tlsServerName"
+	AnnotationTLSInsecureSkipVerify     = "tlsInsecureSkipVerify"
+	AnnotationHTTPBasicAuthUsernameEnv  = "httpBasicAuthUsernameEnvVar"
+	AnnotationHTTPBasicAuthPasswordEnv  = "httpBasicAuthPasswordEnvVar"
+	AnnotationHTTPBearerTokenEnv        = "httpBearerTokenEnvVar"
+	AnnotationTLSCAFile                 = "tlsCAFile"
+	AnnotationTLSCertFile               = "tlsCertFile"
+	AnnotationTLSKeyFile                = "tlsKeyFile"
 
-	// Extended annotations.
-	AnnotationParams                      = "params"
-	AnnotationJob                         = "job"
-	AnnotationCollectionInterval          = "collectionInterval"
-	AnnotationCollectionTimeout           = "collectionTimeout"
-	AnnotationServiceAccountBearerToken   = "serviceAccountBearerToken"
-	AnnotationHTTPProxyURL                = "httpProxyURL"
-	AnnotationTLSServerName               = "tlsServerName"
-	AnnotationTLSInsecureSkipVerify       = "tlsInsecureSkipVerify"
-	AnnotationHTTPBasicAuthUsernameEnvVar = "httpBasicAuthUsernameEnvVar"
-	AnnotationHTTPBasicAuthPasswordEnvVar = "httpBasicAuthPasswordEnvVar"
-	AnnotationHTTPBasicAuthPasswordFile   = "httpBasicAuthPasswordFile"
-	AnnotationHTTPBearerTokenEnvVar       = "httpBearerTokenEnvVar"
-	AnnotationHTTPBearerTokenFile         = "httpBearerTokenFile"
-	AnnotationTLSCAFile                   = "tlsCAFile"
-	AnnotationTLSCertFile                 = "tlsCertFile"
-	AnnotationTLSKeyFile                  = "tlsKeyFile"
-
-	// ExclusionAnnotation marks a pod/service to be excluded from scraping.
 	ExclusionAnnotation = "vector.dev/exclude"
 )
 
 const defaultAnnotationPrefix = "prometheus.io"
 
-// Annot returns the full annotation key for the given short name using the
-// configured annotation prefix (e.g. Annot("scrape") → "prometheus.io/scrape").
 func (c Config) Annot(key string) string {
 	return c.AnnotationPrefix + "/" + key
 }
 
-// Load reads configuration from environment variables with sensible defaults.
 func Load() (Config, error) {
 	cfg := Config{
 		Namespace:        envOr("NAMESPACE", ""),
@@ -73,10 +90,20 @@ func Load() (Config, error) {
 		ScrapeTimeout:    durEnvOr("SCRAPE_TIMEOUT", 10*time.Second),
 		HonorLabels:      boolEnvOr("HONOR_LABELS", false),
 		ResyncInterval:   durEnvOr("RESYNC_INTERVAL", 5*time.Minute),
+		DebounceInterval: durEnvOr("DEBOUNCE_INTERVAL", 250*time.Millisecond),
 		MetricsAddr:      envOr("METRICS_LISTEN_ADDR", ":9090"),
 		ClusterLabel:     envOr("CLUSTER_LABEL", ""),
 		AdditionalLabels: labelsEnvOr("ADDITIONAL_LABELS"),
 		AnnotationPrefix: envOr("ANNOTATION_PREFIX", defaultAnnotationPrefix),
+
+		Roles:              parseRoles(envOr("ROLES", "pod,endpointslice")),
+		Selectors:          parseSelectors(),
+		AttachNodeMetadata: boolEnvOr("ATTACH_NODE_METADATA", false),
+		AttachNsMetadata:   boolEnvOr("ATTACH_NAMESPACE_METADATA", false),
+		IncludeAnnotations: boolEnvOr("INCLUDE_ANNOTATIONS", false),
+		IncludeLabels:      boolEnvOr("INCLUDE_LABELS", true),
+		NodeScrapePort:     int32EnvOr("NODE_SCRAPE_PORT", 10250),
+		ServiceDNSSuffix:   envOr("SERVICE_DNS_SUFFIX", "svc.cluster.local"),
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
@@ -91,7 +118,82 @@ func (c Config) validate() error {
 	if c.ScrapeInterval < 5*time.Second {
 		return fmt.Errorf("SCRAPE_INTERVAL must be >= 5s, got %s", c.ScrapeInterval)
 	}
+	if c.DebounceInterval < 0 {
+		return fmt.Errorf("DEBOUNCE_INTERVAL must be >= 0, got %s", c.DebounceInterval)
+	}
 	return nil
+}
+
+func parseRoles(v string) Roles {
+	var r Roles
+	if v == "" {
+		r.Pod = true
+		r.EndpointSlice = true
+		return r
+	}
+	parts := strings.SplitSeq(v, ",")
+	for p := range parts {
+		switch strings.ToLower(strings.TrimSpace(p)) {
+		case "pod":
+			r.Pod = true
+		case "endpointslice":
+			r.EndpointSlice = true
+		case "node":
+			r.Node = true
+		case "ingress":
+			r.Ingress = true
+		case "service":
+			r.ServiceAddress = true
+		}
+	}
+	if !r.Pod && !r.EndpointSlice && !r.Node && !r.Ingress && !r.ServiceAddress {
+		r.Pod = true
+		r.EndpointSlice = true
+	}
+	return r
+}
+
+func parseSelectors() Selectors {
+	return Selectors{
+		PodLabel:           envOr("POD_LABEL_SELECTOR", ""),
+		PodField:           envOr("POD_FIELD_SELECTOR", ""),
+		ServiceLabel:       envOr("SERVICE_LABEL_SELECTOR", ""),
+		ServiceField:       envOr("SERVICE_FIELD_SELECTOR", ""),
+		NodeLabel:          envOr("NODE_LABEL_SELECTOR", ""),
+		NodeField:          envOr("NODE_FIELD_SELECTOR", ""),
+		IngressLabel:       envOr("INGRESS_LABEL_SELECTOR", ""),
+		IngressField:       envOr("INGRESS_FIELD_SELECTOR", ""),
+		EndpointSliceLabel: envOr("ENDPOINTSLICE_LABEL_SELECTOR", ""),
+		EndpointSliceField: envOr("ENDPOINTSLICE_FIELD_SELECTOR", ""),
+	}
+}
+
+func (r Roles) Any() bool {
+	return r.Pod || r.EndpointSlice || r.Node || r.Ingress || r.ServiceAddress
+}
+
+func (r Roles) Slice() []string {
+	var out []string
+	if r.Pod {
+		out = append(out, "pod")
+	}
+	if r.EndpointSlice {
+		out = append(out, "endpointslice")
+	}
+	if r.Node {
+		out = append(out, "node")
+	}
+	if r.Ingress {
+		out = append(out, "ingress")
+	}
+	if r.ServiceAddress {
+		out = append(out, "service")
+	}
+	return out
+}
+
+func (r Roles) String() string {
+	return strings.Join(r.Slice(), ",")
 }
 
 func envOr(key, fallback string) string {
@@ -111,6 +213,30 @@ func durEnvOr(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func int32EnvOr(key string, fallback int32) int32 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 32)
+	if err != nil {
+		return fallback
+	}
+	return int32(n)
+}
+
+func boolEnvOr(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
 
 func labelsEnvOr(key string) map[string]string {
@@ -141,28 +267,10 @@ func labelsEnvOr(key string) map[string]string {
 	return m
 }
 
-func boolEnvOr(key string, fallback bool) bool {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return fallback
-	}
-	return b
-}
-
 func indexByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
+	return strings.IndexByte(s, b)
 }
 
-// ParseBool parses a bool string, returning fallback on failure.
 func ParseBool(s string, fallback bool) bool {
 	b, err := strconv.ParseBool(s)
 	if err != nil {

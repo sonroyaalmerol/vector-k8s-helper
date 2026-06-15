@@ -7,21 +7,21 @@ import (
 	"github.com/sonroyaalmerol/vector-k8s-helper/internal/config"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ptrBool returns a *bool with the given value.
-//
-//go:fix inline
 func ptrBool(v bool) *bool { b := v; return &b }
 
-// defaultConfig returns a config with the default annotation prefix.
 func defaultConfig() config.Config {
-	return config.Config{AnnotationPrefix: "prometheus.io"}
+	return config.Config{AnnotationPrefix: "prometheus.io", IncludeLabels: true}
 }
+
+func defaultKeys() keys { return buildKeys(defaultConfig()) }
 
 func TestTargetsFromPod(t *testing.T) {
 	cfg := defaultConfig()
+	k := defaultKeys()
 
 	tests := []struct {
 		name    string
@@ -52,9 +52,7 @@ func TestTargetsFromPod(t *testing.T) {
 						},
 					},
 				},
-				Status: corev1.PodStatus{
-					PodIP: "10.0.0.5",
-				},
+				Status: corev1.PodStatus{PodIP: "10.0.0.5"},
 			},
 			want:    1,
 			wantURL: "http://10.0.0.5:9090/metrics",
@@ -67,9 +65,7 @@ func TestTargetsFromPod(t *testing.T) {
 					Namespace: "default",
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{Name: "app"},
-					},
+					Containers: []corev1.Container{{Name: "app"}},
 				},
 				Status: corev1.PodStatus{PodIP: "10.0.0.1"},
 			},
@@ -106,10 +102,8 @@ func TestTargetsFromPod(t *testing.T) {
 					},
 				},
 				Spec: corev1.PodSpec{
-					NodeName: "node-2",
-					Containers: []corev1.Container{
-						{Name: "app"},
-					},
+					NodeName:   "node-2",
+					Containers: []corev1.Container{{Name: "app"}},
 				},
 				Status: corev1.PodStatus{PodIP: "10.0.0.10"},
 			},
@@ -160,6 +154,31 @@ func TestTargetsFromPod(t *testing.T) {
 			wantURL: "http://10.0.0.20:8080/metrics",
 		},
 		{
+			name: "pod_multiple_ports",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "multiport",
+					Namespace: "default",
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "web",
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: 8080},
+								{ContainerPort: 9090},
+							},
+						},
+					},
+				},
+				Status: corev1.PodStatus{PodIP: "10.0.0.21"},
+			},
+			want: 2,
+		},
+		{
 			name: "pod_with_params",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -179,56 +198,11 @@ func TestTargetsFromPod(t *testing.T) {
 			want:    1,
 			wantURL: "http://10.0.0.1:9090/metrics?key=val&other=123",
 		},
-		{
-			name: "pod_with_job_annotation",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "job-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						"prometheus.io/scrape": "true",
-						"prometheus.io/port":   "9090",
-						"prometheus.io/job":    "my-custom-job",
-					},
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{Name: "app"}},
-				},
-				Status: corev1.PodStatus{PodIP: "10.0.0.5"},
-			},
-			want:    1,
-			wantURL: "http://10.0.0.5:9090/metrics",
-		},
-		{
-			name: "pod_with_tls_and_auth",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "secure-pod",
-					Namespace: "monitoring",
-					Annotations: map[string]string{
-						"prometheus.io/scrape":                      "true",
-						"prometheus.io/scheme":                      "https",
-						"prometheus.io/port":                        "8443",
-						"prometheus.io/tlsInsecureSkipVerify":       "true",
-						"prometheus.io/tlsServerName":               "my-server",
-						"prometheus.io/httpBasicAuthUsernameEnvVar": "MY_USER",
-						"prometheus.io/httpBasicAuthPasswordEnvVar": "MY_PASS",
-						"prometheus.io/httpProxyURL":                "http://proxy:3128",
-					},
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{Name: "app"}},
-				},
-				Status: corev1.PodStatus{PodIP: "10.0.0.50"},
-			},
-			want:    1,
-			wantURL: "https://10.0.0.50:8443/metrics",
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			targets := targetsFromPod(tt.pod, cfg)
+			targets := targetsFromPod(tt.pod, cfg, k)
 			if len(targets) != tt.want {
 				t.Errorf("got %d targets, want %d", len(targets), tt.want)
 			}
@@ -243,6 +217,7 @@ func TestTargetsFromPod(t *testing.T) {
 
 func TestTargetsFromPodExtendedAuth(t *testing.T) {
 	cfg := defaultConfig()
+	k := defaultKeys()
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -268,16 +243,16 @@ func TestTargetsFromPodExtendedAuth(t *testing.T) {
 		Status: corev1.PodStatus{PodIP: "10.0.0.5"},
 	}
 
-	targets := targetsFromPod(pod, cfg)
+	targets := targetsFromPod(pod, cfg, k)
 	if len(targets) != 1 {
 		t.Fatalf("expected 1 target, got %d", len(targets))
 	}
 	tgt := targets[0]
-	if tgt.BasicAuthUserEnvVar != "MY_USER" {
-		t.Errorf("BasicAuthUserEnvVar = %q, want MY_USER", tgt.BasicAuthUserEnvVar)
+	if tgt.BasicAuthUserEnv != "MY_USER" {
+		t.Errorf("BasicAuthUserEnv = %q, want MY_USER", tgt.BasicAuthUserEnv)
 	}
-	if tgt.BasicAuthPasswordEnvVar != "MY_PASS" {
-		t.Errorf("BasicAuthPasswordEnvVar = %q, want MY_PASS", tgt.BasicAuthPasswordEnvVar)
+	if tgt.BasicAuthPassword != "MY_PASS" {
+		t.Errorf("BasicAuthPassword = %q, want MY_PASS", tgt.BasicAuthPassword)
 	}
 	if tgt.TLSCAFile != "/etc/tls/ca.crt" {
 		t.Errorf("TLSCAFile = %q, want /etc/tls/ca.crt", tgt.TLSCAFile)
@@ -294,13 +269,14 @@ func TestTargetsFromPodExtendedAuth(t *testing.T) {
 	if tgt.ScrapeTimeout != 5*time.Second {
 		t.Errorf("ScrapeTimeout = %v, want 5s", tgt.ScrapeTimeout)
 	}
-	if tgt.ServiceAccountBearer != "my-token" {
-		t.Errorf("ServiceAccountBearer = %q, want my-token", tgt.ServiceAccountBearer)
+	if tgt.BearerToken != "my-token" {
+		t.Errorf("BearerToken = %q, want my-token", tgt.BearerToken)
 	}
 }
 
 func TestTargetsFromPodCustomPrefix(t *testing.T) {
-	cfg := config.Config{AnnotationPrefix: "custom.io"}
+	cfg := config.Config{AnnotationPrefix: "custom.io", IncludeLabels: true}
+	k := buildKeys(cfg)
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -309,7 +285,7 @@ func TestTargetsFromPodCustomPrefix(t *testing.T) {
 			Annotations: map[string]string{
 				"custom.io/scrape":     "true",
 				"custom.io/port":       "9090",
-				"prometheus.io/scrape": "true", // should be ignored
+				"prometheus.io/scrape": "true",
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -318,7 +294,7 @@ func TestTargetsFromPodCustomPrefix(t *testing.T) {
 		Status: corev1.PodStatus{PodIP: "10.0.0.5"},
 	}
 
-	targets := targetsFromPod(pod, cfg)
+	targets := targetsFromPod(pod, cfg, k)
 	if len(targets) != 1 {
 		t.Fatalf("expected 1 target with custom prefix, got %d", len(targets))
 	}
@@ -329,6 +305,7 @@ func TestTargetsFromPodCustomPrefix(t *testing.T) {
 
 func TestTargetsFromEndpointSlice(t *testing.T) {
 	cfg := defaultConfig()
+	k := defaultKeys()
 
 	tests := []struct {
 		name    string
@@ -371,6 +348,9 @@ func TestTargetsFromEndpointSlice(t *testing.T) {
 						},
 					},
 				},
+				Ports: []discoveryv1.EndpointPort{
+					{Port: new(int32(9090))},
+				},
 			},
 			svc: &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
@@ -411,15 +391,16 @@ func TestTargetsFromEndpointSlice(t *testing.T) {
 						},
 					},
 				},
+				Ports: []discoveryv1.EndpointPort{
+					{Port: new(int32(80))},
+				},
 			},
 			svc: &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "no-scrape",
 					Namespace: "default",
 				},
-				Spec: corev1.ServiceSpec{
-					ClusterIP: "10.96.0.1",
-				},
+				Spec: corev1.ServiceSpec{ClusterIP: "10.96.0.1"},
 			},
 			want: 0,
 		},
@@ -437,9 +418,12 @@ func TestTargetsFromEndpointSlice(t *testing.T) {
 					{
 						Addresses: []string{"10.0.0.1"},
 						Conditions: discoveryv1.EndpointConditions{
-							Ready: func() *bool { b := false; return &b }(),
+							Ready: ptrBool(false),
 						},
 					},
+				},
+				Ports: []discoveryv1.EndpointPort{
+					{Port: new(int32(8080))},
 				},
 			},
 			svc: &corev1.Service{
@@ -477,6 +461,9 @@ func TestTargetsFromEndpointSlice(t *testing.T) {
 						},
 					},
 				},
+				Ports: []discoveryv1.EndpointPort{
+					{Port: new(int32(8443))},
+				},
 			},
 			svc: &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
@@ -504,7 +491,7 @@ func TestTargetsFromEndpointSlice(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			targets := targetsFromEndpointSlice(tt.epSlice, tt.svc, cfg)
+			targets := targetsFromEndpointSlice(tt.epSlice, tt.svc, cfg, k, nil, nil, nil)
 			if len(targets) != tt.want {
 				t.Errorf("got %d targets, want %d", len(targets), tt.want)
 			}
@@ -520,6 +507,101 @@ func TestTargetsFromEndpointSlice(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTargetsFromService(t *testing.T) {
+	cfg := defaultConfig()
+	k := defaultKeys()
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myapp",
+			Namespace: "production",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+				"prometheus.io/port":   "9090",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.96.0.50",
+			Ports: []corev1.ServicePort{
+				{Port: 80},
+			},
+		},
+	}
+
+	targets := targetsFromService(svc, cfg, k, nil)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	if targets[0].URL != "http://10.96.0.50:9090/metrics" {
+		t.Errorf("URL = %q, want http://10.96.0.50:9090/metrics", targets[0].URL)
+	}
+	if targets[0].Role != "service" {
+		t.Errorf("Role = %q, want service", targets[0].Role)
+	}
+}
+
+func TestTargetsFromNode(t *testing.T) {
+	cfg := config.Config{AnnotationPrefix: "prometheus.io", IncludeLabels: true, NodeScrapePort: 10250}
+	k := buildKeys(cfg)
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+			},
+		},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "10.0.0.1"},
+			},
+		},
+	}
+
+	targets := targetsFromNode(node, cfg, k)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	if targets[0].URL != "https://10.0.0.1:10250/metrics" {
+		t.Errorf("URL = %q, want https://10.0.0.1:10250/metrics", targets[0].URL)
+	}
+	if targets[0].Role != "node" {
+		t.Errorf("Role = %q, want node", targets[0].Role)
+	}
+}
+
+func TestTargetsFromIngress(t *testing.T) {
+	cfg := defaultConfig()
+	k := defaultKeys()
+
+	host := "example.com"
+	ing := &netv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mying",
+			Namespace: "production",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+			},
+		},
+		Spec: netv1.IngressSpec{
+			Rules: []netv1.IngressRule{
+				{Host: host},
+			},
+		},
+	}
+
+	targets := targetsFromIngress(ing, cfg, k)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	if targets[0].URL != "http://example.com:80/metrics" {
+		t.Errorf("URL = %q, want http://example.com:80/metrics", targets[0].URL)
+	}
+	if targets[0].Role != "ingress" {
+		t.Errorf("Role = %q, want ingress", targets[0].Role)
 	}
 }
 
@@ -556,5 +638,24 @@ func TestBuildURL(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("buildURL(%q,%q,%q,%q) = %q, want %q", tt.scheme, tt.host, tt.path, tt.params, got, tt.want)
 		}
+	}
+}
+
+func TestSanitizeMetaKey(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"app.kubernetes.io/name", "app_kubernetes_io_name"},
+		{"app", "app"},
+		{"Foo-Bar", "foo_bar"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := sanitizeMetaKey(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeMetaKey(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }

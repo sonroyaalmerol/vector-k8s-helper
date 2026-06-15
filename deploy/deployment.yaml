@@ -10,14 +10,17 @@ metadata:
   name: vector-k8s-helper
 rules:
   - apiGroups: [""]
-    resources: ["pods", "services"]
+    resources: ["pods", "services", "nodes", "namespaces"]
     verbs: ["list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "create", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -49,7 +52,6 @@ spec:
       labels:
         app: vector-k8s-helper
       annotations:
-        # Self-monitoring: the helper discovers itself via this annotation.
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/health"
@@ -73,10 +75,25 @@ spec:
               value: "10s"
             - name: CLUSTER_LABEL
               value: ""
+            - name: ROLES
+              value: "pod,endpointslice,node,ingress,service"
+            - name: DEBOUNCE_INTERVAL
+              value: "250ms"
+            - name: INCLUDE_LABELS
+              value: "true"
+            - name: INCLUDE_ANNOTATIONS
+              value: "false"
+            - name: ATTACH_NODE_METADATA
+              value: "false"
+            - name: ATTACH_NAMESPACE_METADATA
+              value: "false"
+          ports:
+            - name: metrics
+              containerPort: 9090
           resources:
             requests:
               cpu: 50m
               memory: 64Mi
             limits:
               cpu: 200m
-              memory: 128Mi
+              memory: 256Mi
