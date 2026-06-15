@@ -195,7 +195,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 	w.logger.Info("started kubernetes informers",
 		"roles", w.cfg.Roles.String(),
-		"namespace", cfgNamespace(w.cfg.Namespace))
+		"namespace", "<all>")
 
 	if !cache.WaitForCacheSync(ctx.Done(), synced...) {
 		return fmt.Errorf("informer cache sync cancelled")
@@ -338,13 +338,6 @@ func (w *Watcher) reconcileLoop(ctx context.Context) {
 			w.reconcile()
 		}
 	}
-}
-
-func cfgNamespace(ns string) string {
-	if ns == "" {
-		return "<all>"
-	}
-	return ns
 }
 
 func (w *Watcher) reconcile() {

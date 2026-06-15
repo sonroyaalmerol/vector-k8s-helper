@@ -10,15 +10,14 @@ import (
 )
 
 type Config struct {
-	Namespace        string
-	ConfigMapName    string
-	ConfigMapKey     string
 	ScrapeInterval   time.Duration
 	ScrapeTimeout    time.Duration
 	HonorLabels      bool
 	ResyncInterval   time.Duration
 	DebounceInterval time.Duration
 	MetricsAddr      string
+	OutputPath       string
+	NodeName         string
 	ClusterLabel     string
 	AdditionalLabels map[string]string
 	AnnotationPrefix string
@@ -32,10 +31,6 @@ type Config struct {
 	IncludeLabels      bool
 	NodeScrapePort     int32
 	ServiceDNSSuffix   string
-	NodeScoped         bool
-	SidecarMode        bool
-	SidecarOutput      string
-	SidecarNode        string
 }
 
 type Roles struct {
@@ -97,15 +92,14 @@ func (c Config) Annot(key string) string {
 
 func Load() (Config, error) {
 	cfg := Config{
-		Namespace:        envOr("NAMESPACE", ""),
-		ConfigMapName:    envOr("CONFIGMAP_NAME", "vector-scrape-config"),
-		ConfigMapKey:     envOr("CONFIGMAP_KEY", "scrape_sources.yaml"),
 		ScrapeInterval:   durEnvOr("SCRAPE_INTERVAL", 30*time.Second),
 		ScrapeTimeout:    durEnvOr("SCRAPE_TIMEOUT", 10*time.Second),
 		HonorLabels:      boolEnvOr("HONOR_LABELS", false),
 		ResyncInterval:   durEnvOr("RESYNC_INTERVAL", 5*time.Minute),
 		DebounceInterval: durEnvOr("DEBOUNCE_INTERVAL", 250*time.Millisecond),
 		MetricsAddr:      envOr("METRICS_LISTEN_ADDR", ":9090"),
+		OutputPath:       envOr("OUTPUT_PATH", "/etc/vector/discovered/scrape_sources.yaml"),
+		NodeName:         os.Getenv("VECTOR_SELF_NODE_NAME"),
 		ClusterLabel:     envOr("CLUSTER_LABEL", ""),
 		AdditionalLabels: labelsEnvOr("ADDITIONAL_LABELS"),
 		AnnotationPrefix: envOr("ANNOTATION_PREFIX", defaultAnnotationPrefix),
@@ -119,10 +113,6 @@ func Load() (Config, error) {
 		IncludeLabels:      boolEnvOr("INCLUDE_LABELS", true),
 		NodeScrapePort:     int32EnvOr("NODE_SCRAPE_PORT", 10250),
 		ServiceDNSSuffix:   envOr("SERVICE_DNS_SUFFIX", "svc.cluster.local"),
-		NodeScoped:         boolEnvOr("NODE_SCOPED", false),
-		SidecarMode:        boolEnvOr("SIDECAR", false),
-		SidecarOutput:      envOr("SIDECAR_OUTPUT", "/etc/vector/discovered/scrape_sources.yaml"),
-		SidecarNode:        os.Getenv("VECTOR_SELF_NODE_NAME"),
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
@@ -131,8 +121,8 @@ func Load() (Config, error) {
 }
 
 func (c Config) validate() error {
-	if c.ConfigMapName == "" {
-		return fmt.Errorf("CONFIGMAP_NAME must be set")
+	if c.OutputPath == "" {
+		return fmt.Errorf("OUTPUT_PATH must be set")
 	}
 	if c.ScrapeInterval < 5*time.Second {
 		return fmt.Errorf("SCRAPE_INTERVAL must be >= 5s, got %s", c.ScrapeInterval)

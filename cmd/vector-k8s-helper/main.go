@@ -15,7 +15,6 @@ import (
 	"github.com/sonroyaalmerol/vector-k8s-helper/internal/config"
 	"github.com/sonroyaalmerol/vector-k8s-helper/internal/discovery"
 	"github.com/sonroyaalmerol/vector-k8s-helper/internal/renderer"
-	"github.com/sonroyaalmerol/vector-k8s-helper/internal/writer"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -34,17 +33,12 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("configuration loaded",
-		"namespace", cfg.Namespace,
-		"configmap", cfg.ConfigMapName,
 		"roles", cfg.Roles.String(),
 		"scrape_interval", cfg.ScrapeInterval,
 		"scrape_timeout", cfg.ScrapeTimeout,
 		"cluster_label", cfg.ClusterLabel,
-		"honor_labels", cfg.HonorLabels,
-		"attach_node_metadata", cfg.AttachNodeMetadata,
-		"attach_namespace_metadata", cfg.AttachNsMetadata,
-		"include_labels", cfg.IncludeLabels,
-		"include_annotations", cfg.IncludeAnnotations,
+		"node_name", cfg.NodeName,
+		"output_path", cfg.OutputPath,
 	)
 
 	k8sCfg, err := rest.InClusterConfig()
@@ -64,8 +58,8 @@ func main() {
 
 	go serveHealth(ctx, cfg.MetricsAddr, logger)
 
-	if cfg.SidecarMode && cfg.SidecarNode != "" {
-		cfg.Selectors.PodField = "spec.nodeName=" + cfg.SidecarNode
+	if cfg.NodeName != "" {
+		cfg.Selectors.PodField = "spec.nodeName=" + cfg.NodeName
 	}
 
 	rendCfg := renderer.Config{
@@ -74,20 +68,16 @@ func main() {
 		HonorLabels:        cfg.HonorLabels,
 		ClusterLabel:       cfg.ClusterLabel,
 		AdditionalLabels:   cfg.AdditionalLabels,
-		NodeScoped:         cfg.NodeScoped,
 	}
 
-	if cfg.SidecarMode {
-		seed, err := renderer.RenderEmpty(rendCfg)
-		if err != nil {
-			logger.Error("failed to render seed config", "error", err)
-		} else if err := os.WriteFile(cfg.SidecarOutput, seed, 0o644); err != nil {
-			logger.Error("failed to write seed config", "error", err, "path", cfg.SidecarOutput)
-		}
+	seed, err := renderer.RenderEmpty(rendCfg)
+	if err != nil {
+		logger.Error("failed to render seed config", "error", err)
+	} else if err := os.WriteFile(cfg.OutputPath, seed, 0o644); err != nil {
+		logger.Error("failed to write seed config", "error", err, "path", cfg.OutputPath)
 	}
 
 	w := discovery.NewWatcher(client, cfg, logger)
-	wr := writer.NewWriter(client, cfg.Namespace, cfg.ConfigMapKey, logger)
 
 	go func() {
 		if err := w.Run(ctx); err != nil && ctx.Err() == nil {
@@ -106,29 +96,14 @@ func main() {
 			continue
 		}
 
-		if cfg.SidecarMode {
-			if bytes.Equal(content, lastContent) {
-				logger.Debug("config unchanged, skipping write")
-				continue
-			}
-			lastContent = content
-			if err := os.WriteFile(cfg.SidecarOutput, content, 0o644); err != nil {
-				logger.Error("failed to write sidecar config", "error", err, "path", cfg.SidecarOutput)
-			}
-			continue
-		}
-
 		if bytes.Equal(content, lastContent) {
-			logger.Debug("config unchanged, skipping write")
 			continue
 		}
 		lastContent = content
 
-		writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		if err := wr.Upsert(writeCtx, cfg.ConfigMapName, content); err != nil {
-			logger.Error("failed to write configmap", "error", err)
+		if err := os.WriteFile(cfg.OutputPath, content, 0o644); err != nil {
+			logger.Error("failed to write config", "error", err, "path", cfg.OutputPath)
 		}
-		cancel()
 	}
 
 	logger.Info("shutting down")
