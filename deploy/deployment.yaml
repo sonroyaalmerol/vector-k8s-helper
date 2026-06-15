@@ -1,7 +1,10 @@
+# vector-k8s-helper — sidecar DaemonSet for metrics discovery + scraping.
+# Each pod discovers its own node's targets and scrapes them locally.
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: vector-k8s-helper
+  name: vector-metrics
   namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -12,107 +15,130 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "services", "nodes", "namespaces"]
     verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list", "watch"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["list", "watch"]
-  - apiGroups: [""]
-    resources: ["endpoints"]
-    verbs: ["list", "watch"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: vector-k8s-helper
+  name: vector-metrics-helper
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: vector-k8s-helper
 subjects:
   - kind: ServiceAccount
-    name: vector-k8s-helper
+    name: vector-metrics
     namespace: kube-system
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
-  name: vector-k8s-helper
+  name: vector-metrics
   namespace: kube-system
   labels:
-    app: vector-k8s-helper
+    app: vector-metrics
 spec:
-  replicas: 1
   selector:
     matchLabels:
-      app: vector-k8s-helper
+      app: vector-metrics
   template:
     metadata:
       labels:
-        app: vector-k8s-helper
+        app: vector-metrics
     spec:
-      serviceAccountName: vector-k8s-helper
+      serviceAccountName: vector-metrics
+      tolerations:
+        - operator: Exists
       containers:
-        - name: vector-k8s-helper
-          image: ghcr.io/sonroyaalmerol/vector-k8s-helper:latest
+        - name: helper
+          image: ghcr.io/sonroyaalmerol/vector-k8s-helper:v0.5.0
+          imagePullPolicy: Always
           env:
-            - name: NAMESPACE
+            - name: VECTOR_SELF_NODE_NAME
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.namespace
-            - name: CONFIGMAP_NAME
-              value: "vector-scrape-config"
-            - name: CONFIGMAP_KEY
-              value: "scrape_sources.yaml"
+                  fieldPath: spec.nodeName
+            - name: ROLES
+              value: "pod,endpoints"
             - name: SCRAPE_INTERVAL
               value: "30s"
             - name: SCRAPE_TIMEOUT
               value: "10s"
-            - name: HONOR_LABELS
-              value: "false"
             - name: CLUSTER_LABEL
               value: "dmz-prod-1"
-            - name: ROLES
-              value: "pod,endpointslice,endpoints"
-            - name: DEBOUNCE_INTERVAL
-              value: "250ms"
-            - name: RESYNC_INTERVAL
-              value: "5m"
             - name: NAMESPACE_EXCLUDE
               value: "kube-system"
             - name: INCLUDE_LABELS
-              value: "true"
-            - name: INCLUDE_ANNOTATIONS
-              value: "false"
-            - name: ATTACH_NODE_METADATA
-              value: "false"
-            - name: ATTACH_NAMESPACE_METADATA
               value: "false"
             - name: METRICS_LISTEN_ADDR
-              value: ":9090"
+              value: ":9091"
           ports:
             - name: health
-              containerPort: 9090
+              containerPort: 9091
           readinessProbe:
             httpGet:
               path: /health
-              port: 9090
+              port: 9091
             initialDelaySeconds: 5
             periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 9090
-            initialDelaySeconds: 15
-            periodSeconds: 20
+          volumeMounts:
+            - name: discovered
+              mountPath: /etc/vector/discovered
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 25m
+              memory: 32Mi
             limits:
-              cpu: 200m
-              memory: 256Mi
+              cpu: 100m
+              memory: 128Mi
+        - name: vector
+          image: timberio/vector:0.56.0-debian
+          args:
+            - --config
+            - /etc/vector/static/main.yaml
+            - --config
+            - /etc/vector/static/sinks.yaml
+            - --config-dir
+            - /etc/vector/discovered
+            - --watch-config
+          env:
+            - name: VECTOR_SELF_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: VECTOR_LOG
+              value: "info"
+            - name: VECTOR_CLUSTER
+              value: "dmz-prod-1"
+          volumeMounts:
+            - name: static
+              mountPath: /etc/vector/static
+              readOnly: true
+            - name: discovered
+              mountPath: /etc/vector/discovered
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/vector
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: static
+          configMap:
+            name: vector-metrics-static
+        - name: discovered
+          emptyDir: {}
+        - name: data
+          emptyDir: {}

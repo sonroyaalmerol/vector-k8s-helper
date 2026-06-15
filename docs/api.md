@@ -10,7 +10,7 @@ github.com/sonroyaalmerol/vector-k8s-helper
 ├── internal/config          # Environment configuration
 ├── internal/discovery       # Kubernetes informer-based target discovery
 ├── internal/renderer        # Vector YAML config generation
-└── internal/writer          # ConfigMap persistence
+└── cmd/vector-k8s-helper   # entry point (file output)
 ```
 
 ---
@@ -29,9 +29,8 @@ All runtime configuration. Populated by `Load` from environment variables.
 
 ```go
 type Config struct {
-    Namespace        string
-    ConfigMapName    string
-    ConfigMapKey     string
+    OutputPath       string
+    NodeName         string
     ScrapeInterval   time.Duration
     ScrapeTimeout    time.Duration
     HonorLabels      bool
@@ -324,31 +323,33 @@ import "github.com/sonroyaalmerol/vector-k8s-helper/internal/writer"
 ### types
 
 #### `Writer`
+## Output
 
-```go
-type Writer struct { /* unexported fields */ }
-```
+The rendered config is written directly to a file on a shared volume. No
+intermediaries, no ConfigMaps.
 
-Persists rendered Vector config to a Kubernetes ConfigMap.
+### `renderer.Render(targets []discovery.Target, cfg Config) ([]byte, error)`
 
-##### `NewWriter(client kubernetes.Interface, namespace, configMapKey string, logger *slog.Logger) *Writer`
+Renders targets into a Vector YAML fragment with prometheus_scrape sources
+and the enrich_metrics VRL transform.
 
-Creates a Writer for the given namespace and ConfigMap data key.
+### `renderer.RenderEmpty(cfg Config) ([]byte, error)`
 
-##### `(w *Writer) Upsert(ctx context.Context, name string, content []byte) error`
-
-Creates the ConfigMap if absent, otherwise applies a JSON merge patch. Retries
-on conflict (`409`) and transient network errors with exponential backoff, up
-to three attempts. Returns an error if `namespace` is empty or all attempts
-fail.
+Produces a valid seed config with a no_targets source and enrich_metrics
+transform. Used at startup before the first targets are discovered.
 
 ---
 
 ## `cmd/vector-k8s-helper`
 
-The entrypoint (`main` package). Wires the four stages together:
+The entrypoint (`main` package):
 
 1. Loads config via `config.Load`.
+2. Writes a seed config to the output path.
+3. Creates a watcher, starts informers.
+4. On each reconcile, renders targets and writes to the output file.
+5. Vector loads the file from a shared volume and hot-reloads via
+   `--watch-config`.
 2. Builds the in-cluster Kubernetes client.
 3. Starts the health server (`/health`, `204`) on `METRICS_LISTEN_ADDR`.
 4. Starts `Watcher.Run` in a goroutine.

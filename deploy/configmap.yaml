@@ -1,15 +1,33 @@
+# Static Vector config for the metrics DaemonSet.
+# Mounted alongside the dynamic scrape config written by the sidecar helper.
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: vector-scrape-config
+  name: vector-metrics-static
   namespace: kube-system
-  labels:
-    app: vector-k8s-helper
 data:
-  scrape_sources.yaml: |
+  main.yaml: |
+    data_dir: /var/lib/vector
+  sinks.yaml: |
     sources:
-      no_targets:
-        type: prometheus_scrape
-        endpoints: []
+      internal_metrics:
+        type: internal_metrics
         scrape_interval_secs: 30
-        scrape_timeout_secs: 10
+
+    transforms:
+      tag_internal_metrics:
+        type: remap
+        inputs: ["internal_metrics"]
+        source: |
+          .tags.cluster = "${VECTOR_CLUSTER}"
+
+    sinks:
+      prometheus_remote_write:
+        type: prometheus_remote_write
+        inputs:
+          - enrich_metrics
+          - tag_internal_metrics
+        endpoint: "https://nabu.sgl.com:9091/api/v1/push"
+        healthcheck:
+          enabled: false
