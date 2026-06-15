@@ -428,6 +428,19 @@ func (w *Watcher) reconcile() {
 		}
 	}
 
+	if len(newTargets) == len(w.targets) {
+		same := true
+		for name := range newTargets {
+			if _, ok := w.targets[name]; !ok {
+				same = false
+				break
+			}
+		}
+		if same {
+			return
+		}
+	}
+
 	w.targets = newTargets
 	w.emit()
 }
