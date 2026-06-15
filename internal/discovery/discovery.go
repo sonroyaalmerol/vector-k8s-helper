@@ -88,7 +88,6 @@ type Target struct {
 	Annotations map[string]string
 }
 
-
 type TargetSummary struct {
 	Total      int
 	ByRole     map[string]int
@@ -103,13 +102,13 @@ func SummarizeTargets(targets []Target) TargetSummary {
 		ByRole:     make(map[string]int),
 		Namespaces: make(map[string]int),
 	}
-	sources := make(map[string]bool)
+	sources := make(map[string]struct{})
 	sampleN := min(len(targets), 3)
 	s.Sample = make([]string, 0, sampleN)
 	for i, t := range targets {
 		s.ByRole[t.Role]++
 		s.Namespaces[t.Namespace]++
-		sources[t.URL] = true
+		sources[t.URL] = struct{}{}
 		if i < sampleN {
 			s.Sample = append(s.Sample, t.URL)
 		}
@@ -483,7 +482,7 @@ func (w *Watcher) lookupService(namespace, name string) (*corev1.Service, bool) 
 	if w.svcStore == nil {
 		return nil, false
 	}
-	obj, exists, err := w.svcStore.GetByKey(fmt.Sprintf("%s/%s", namespace, name))
+	obj, exists, err := w.svcStore.GetByKey(namespace + "/" + name)
 	if err != nil || !exists {
 		return nil, false
 	}
@@ -709,13 +708,23 @@ func targetsFromPod(pod *corev1.Pod, cfg config.Config, k keys) []Target {
 	targets := make([]Target, 0, len(ports))
 	for _, pp := range ports {
 		t := base
-		hostPort := net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(pp.number)))
+		portStr := strconv.Itoa(int(pp.number))
+		hostPort := net.JoinHostPort(pod.Status.PodIP, portStr)
 		t.Instance = hostPort
-		t.Name = sanitizeName(fmt.Sprintf("pod_%s_%s_%d", pod.Namespace, pod.Name, pp.number))
+		var nb strings.Builder
+		nb.Grow(len(pod.Namespace) + len(pod.Name) + 20)
+		nb.WriteString("pod_")
+		sanitizeWrite(&nb, pod.Namespace)
+		nb.WriteByte('_')
+		sanitizeWrite(&nb, pod.Name)
+		nb.WriteByte('_')
+		var pbuf [12]byte
+		nb.Write(strconv.AppendInt(pbuf[:0], int64(pp.number), 10))
+		t.Name = nb.String()
 		t.URL = buildURL(scheme, hostPort, path, t.Params)
 		t.Container = pp.container
 		t.PortName = pp.name
-		t.PortNumber = strconv.FormatInt(int64(pp.number), 10)
+		t.PortNumber = portStr
 		t.PortProtocol = pp.protocol
 		t.ContainerInit = boolStr(pp.isInit)
 		cImage, cID := containerStatusFor(pod.Status.ContainerStatuses, pp.container)
@@ -807,20 +816,31 @@ func targetsFromEndpointSlice(epSlice *discoveryv1.EndpointSlice, svc *corev1.Se
 		if port.Protocol != nil {
 			portProto = string(*port.Protocol)
 		}
+		portStr := strconv.FormatInt(int64(portNum), 10)
 		for _, ep := range epSlice.Endpoints {
 			ready := ep.Conditions.Ready != nil && *ep.Conditions.Ready
 			for _, addr := range ep.Addresses {
-				hostPort := net.JoinHostPort(addr, strconv.Itoa(int(portNum)))
+				hostPort := net.JoinHostPort(addr, portStr)
 				t := Target{}
 				t.Role = "endpointslice"
 				t.Namespace = epSlice.Namespace
 				t.Service = svc.Name
 				t.Instance = hostPort
 				t.URL = buildURL(scheme, hostPort, path, svc.Annotations[k.params])
-				t.Name = sanitizeName(fmt.Sprintf("ep_%s_%s_%s_%d", epSlice.Namespace, svc.Name, sanitizeIP(addr), portNum))
+				var nb strings.Builder
+				nb.Grow(len(epSlice.Namespace) + len(svc.Name) + len(addr) + 20)
+				nb.WriteString("ep_")
+				sanitizeWrite(&nb, epSlice.Namespace)
+				nb.WriteByte('_')
+				sanitizeWrite(&nb, svc.Name)
+				nb.WriteByte('_')
+				sanitizeWrite(&nb, addr)
+				nb.WriteByte('_')
+				nb.WriteString(portStr)
+				t.Name = nb.String()
 				t.ServicePortName = portName
 				t.PortName = portName
-				t.PortNumber = strconv.FormatInt(int64(portNum), 10)
+				t.PortNumber = portStr
 				t.PortProtocol = portProto
 				t.EndpointSliceName = epSlice.Name
 				t.EndpointReady = boolStr(ready)
@@ -893,17 +913,18 @@ func targetsFromEndpoints(eps *corev1.Endpoints, svc *corev1.Service, cfg config
 		subset := &eps.Subsets[i]
 		for _, sp := range resolveSubsetPorts(subset.Ports, scrapePortStr) {
 			portNum := sp.Port
+			portStr := strconv.FormatInt(int64(portNum), 10)
 			for _, addr := range subset.Addresses {
-				hostPort := net.JoinHostPort(addr.IP, strconv.Itoa(int(portNum)))
+				hostPort := net.JoinHostPort(addr.IP, portStr)
 				t := Target{}
 				t.Role = "endpoints"
 				t.Namespace = eps.Namespace
 				t.Service = svc.Name
 				t.Instance = hostPort
 				t.URL = buildURL(scheme, hostPort, path, svc.Annotations[k.params])
-				t.Name = sanitizeName(fmt.Sprintf("ep_%s_%s_%s_%d", eps.Namespace, svc.Name, sanitizeIP(addr.IP), portNum))
+				t.Name = sanitizeName("ep_" + eps.Namespace + "_" + svc.Name + "_" + sanitizeIP(addr.IP) + "_" + portStr)
 				t.PortName = sp.Name
-				t.PortNumber = strconv.FormatInt(int64(portNum), 10)
+				t.PortNumber = portStr
 				t.PortProtocol = string(sp.Protocol)
 				t.EndpointReady = "true"
 				if addr.Hostname != "" {
@@ -957,7 +978,7 @@ func targetsFromService(svc *corev1.Service, cfg config.Config, k keys, nsStore 
 		host = external
 	}
 	if host == "" || host == "None" {
-		host = fmt.Sprintf("%s.%s.%s", svc.Name, svc.Namespace, cfg.ServiceDNSSuffix)
+		host = svc.Name + "." + svc.Namespace + "." + cfg.ServiceDNSSuffix
 	}
 
 	type svcPort struct {
@@ -998,18 +1019,19 @@ func targetsFromService(svc *corev1.Service, cfg config.Config, k keys, nsStore 
 	targets := make([]Target, 0, len(ports))
 	for _, sp := range ports {
 		t := Target{}
+		portStr := strconv.Itoa(int(sp.number))
 		t.Role = "service"
 		t.Namespace = svc.Namespace
 		t.Service = svc.Name
-		t.Instance = net.JoinHostPort(host, strconv.Itoa(int(sp.number)))
+		t.Instance = net.JoinHostPort(host, portStr)
 		t.URL = buildURL(scheme, t.Instance, path, svc.Annotations[k.params])
-		t.Name = sanitizeName(fmt.Sprintf("svc_%s_%s_%d", svc.Namespace, svc.Name, sp.number))
+		t.Name = sanitizeName("svc_" + svc.Namespace + "_" + svc.Name + "_" + portStr)
 		t.ServiceType = string(svc.Spec.Type)
 		t.ServiceClusterIP = svc.Spec.ClusterIP
 		t.ServiceExternalName = external
 		t.ServicePortName = sp.name
 		t.PortName = sp.name
-		t.PortNumber = strconv.FormatInt(int64(sp.number), 10)
+		t.PortNumber = portStr
 		t.PortProtocol = sp.protocol
 		applyScrapeSettings(&t, svc.Annotations, k)
 		t.Labels = cloneMap(svcLbl)
@@ -1046,9 +1068,10 @@ func targetsFromNode(node *corev1.Node, cfg config.Config, k keys) []Target {
 	t.NodeIP = host
 	t.NodeProviderID = node.Spec.ProviderID
 	t.NodeAddresses = nodeAddresses(node)
-	t.Instance = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	portStr := strconv.Itoa(int(port))
+	t.Instance = net.JoinHostPort(host, portStr)
 	t.URL = buildURL(scheme, t.Instance, path, node.Annotations[k.params])
-	t.Name = sanitizeName(fmt.Sprintf("node_%s_%d", node.Name, port))
+	t.Name = sanitizeName("node_" + node.Name + "_" + portStr)
 	applyScrapeSettings(&t, node.Annotations, k)
 	t.Labels, t.Annotations = metadataMaps("node", node.Labels, node.Annotations, cfg)
 	return []Target{t}
@@ -1089,8 +1112,9 @@ func targetsFromIngress(ing *netv1.Ingress, cfg config.Config, k keys) []Target 
 
 	ingLbl, ingAnn := metadataMaps("ingress", ing.Labels, ing.Annotations, cfg)
 
+	portNumStr := strconv.Itoa(int(port))
 	var targets []Target
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{})
 	className := ""
 	if ing.Spec.IngressClassName != nil {
 		className = *ing.Spec.IngressClassName
@@ -1102,17 +1126,17 @@ func targetsFromIngress(ing *netv1.Ingress, cfg config.Config, k keys) []Target 
 		if rulePath == "" {
 			rulePath = "/"
 		}
-		key := host + ":" + strconv.Itoa(int(port))
-		if seen[key] {
+		key := host + ":" + portNumStr
+		if _, ok := seen[key]; ok {
 			return
 		}
-		seen[key] = true
+		seen[key] = struct{}{}
 		t := Target{}
 		t.Role = "ingress"
 		t.Namespace = ing.Namespace
 		t.Instance = key
 		t.URL = buildURL(scheme, key, path, ing.Annotations[k.params])
-		t.Name = sanitizeName(fmt.Sprintf("ing_%s_%s_%s", ing.Namespace, ing.Name, sanitizeIP(host)))
+		t.Name = sanitizeName("ing_" + ing.Namespace + "_" + ing.Name + "_" + sanitizeIP(host))
 		t.IngressClassName = className
 		t.IngressPath = rulePath
 		t.IngressScheme = scheme
@@ -1175,7 +1199,7 @@ func resolveSubsetPorts(ports []corev1.EndpointPort, scrapePortStr string) []cor
 }
 
 func lookupPod(store cache.Store, namespace, name string) (*corev1.Pod, bool) {
-	obj, exists, err := store.GetByKey(fmt.Sprintf("%s/%s", namespace, name))
+	obj, exists, err := store.GetByKey(namespace + "/" + name)
 	if err != nil || !exists {
 		return nil, false
 	}
@@ -1244,17 +1268,37 @@ func defaultStr(v, def string) string {
 var sanitizeIPReplacer = strings.NewReplacer(".", "_", ":", "_")
 
 func sanitizeIP(ip string) string {
+	if !strings.ContainsAny(ip, "./:") {
+		return ip
+	}
 	return sanitizeIPReplacer.Replace(ip)
 }
 
 var sanitizeNameReplacer = strings.NewReplacer(".", "_", "-", "_", "/", "_")
 
 func sanitizeName(name string) string {
+	if !strings.ContainsAny(name, ".-/") {
+		return name
+	}
 	return sanitizeNameReplacer.Replace(name)
 }
 
+// sanitizeWrite appends s to b with '.', '-', '/' replaced by '_'.
+func sanitizeWrite(b *strings.Builder, s string) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' || c == '-' || c == '/' {
+			c = '_'
+		}
+		b.WriteByte(c)
+	}
+}
+
 func sanitizeMetaKey(key string) string {
-	key = strings.ToLower(key)
+	// Fast path: already lowercase alphanumeric, nothing to transform.
+	if isCleanMetaKey(key) {
+		return key
+	}
 	var b strings.Builder
 	b.Grow(len(key))
 	for i := 0; i < len(key); i++ {
@@ -1262,9 +1306,21 @@ func sanitizeMetaKey(key string) string {
 		switch {
 		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
 			b.WriteByte(c)
+		case c >= 'A' && c <= 'Z':
+			b.WriteByte(c + 32)
 		default:
 			b.WriteByte('_')
 		}
 	}
 	return b.String()
+}
+
+func isCleanMetaKey(key string) bool {
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }

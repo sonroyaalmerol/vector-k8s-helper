@@ -288,6 +288,15 @@ func indexByte(s string, b byte) int {
 }
 
 func ParseBool(s string, fallback bool) bool {
+	if s == "" {
+		return fallback
+	}
+	switch s {
+	case "true", "True", "TRUE", "1", "t", "T":
+		return true
+	case "false", "False", "FALSE", "0", "f", "F":
+		return false
+	}
 	b, err := strconv.ParseBool(s)
 	if err != nil {
 		return fallback

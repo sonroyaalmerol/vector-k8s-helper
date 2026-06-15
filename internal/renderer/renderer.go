@@ -3,6 +3,7 @@ package renderer
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/sonroyaalmerol/vector-k8s-helper/internal/discovery"
@@ -292,12 +293,15 @@ func buildRemapSource(targets []discovery.Target, cfg Config) string {
 		t        discovery.Target
 	}
 	entries := make([]entry, 0, len(targets))
-	seen := make(map[string]bool, len(targets))
+	seen := make(map[string]struct{}, len(targets))
 	for _, t := range targets {
-		if t.Instance == "" || seen[t.Instance] {
+		if t.Instance == "" {
 			continue
 		}
-		seen[t.Instance] = true
+		if _, ok := seen[t.Instance]; ok {
+			continue
+		}
+		seen[t.Instance] = struct{}{}
 		entries = append(entries, entry{instance: t.Instance, t: t})
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -305,14 +309,20 @@ func buildRemapSource(targets []discovery.Target, cfg Config) string {
 	})
 
 	var b strings.Builder
-	b.Grow(len(entries)*256 + 256)
+	b.Grow(len(entries)*256 + 1024)
+
+	// metadata table must precede the remap logic.
+	b.WriteString("metadata = {\n")
+	for _, e := range entries {
+		writeEntry(&b, e.instance, e.t)
+	}
+	b.WriteString("}\n\n")
 
 	b.WriteString("if .tags.node != get_env_var!(\"VECTOR_SELF_NODE_NAME\") { abort }\n")
-
 	b.WriteString("inst = .tags.instance\n")
 	b.WriteString("m = get!(metadata, [inst])\n")
 	b.WriteString("if m != null {\n")
-	for _, line := range enrichLines() {
+	for _, line := range enrichLinesList {
 		b.WriteString("  ")
 		b.WriteString(line)
 		b.WriteByte('\n')
@@ -321,145 +331,166 @@ func buildRemapSource(targets []discovery.Target, cfg Config) string {
 	b.WriteString("}\n")
 
 	if cfg.ClusterLabel != "" {
-		fmt.Fprintf(&b, ".tags.cluster = \"%s\"\n", cfg.ClusterLabel)
+		b.WriteString(".tags.cluster = \"")
+		b.WriteString(cfg.ClusterLabel)
+		b.WriteString("\"\n")
 	}
 	for _, k := range sortedKeys(cfg.AdditionalLabels) {
-		fmt.Fprintf(&b, ".tags.%s = \"%s\"\n", k, cfg.AdditionalLabels[k])
+		b.WriteString(".tags.")
+		b.WriteString(k)
+		b.WriteString(" = \"")
+		b.WriteString(cfg.AdditionalLabels[k])
+		b.WriteString("\"\n")
 	}
 
-	var pre strings.Builder
-	pre.Grow(len(entries)*256 + 64)
-	pre.WriteString("metadata = {\n")
-	for _, e := range entries {
-		writeEntry(&pre, e.instance, e.t)
-	}
-	pre.WriteString("}\n\n")
-
-	return pre.String() + b.String()
+	return b.String()
 }
 
-func enrichLines() []string {
-	return []string{
-		".tags.namespace = m.namespace",
-		".tags.pod = m.pod",
-		".tags.service = m.service",
-		".tags.node = m.node",
-		".tags.container = m.container",
-		".tags.job = m.job",
-		".tags.role = m.role",
-		".tags.pod_uid = m.pod_uid",
-		".tags.pod_phase = m.pod_phase",
-		".tags.pod_ready = m.pod_ready",
-		".tags.controller_kind = m.controller_kind",
-		".tags.controller_name = m.controller_name",
-		".tags.container_image = m.container_image",
-		".tags.container_id = m.container_id",
-		".tags.container_init = m.container_init",
-		".tags.host_ip = m.host_ip",
-		".tags.pod_ip = m.pod_ip",
-		".tags.node_ip = m.node_ip",
-		".tags.port_name = m.port_name",
-		".tags.port_number = m.port_number",
-		".tags.port_protocol = m.port_protocol",
-		".tags.service_port_name = m.service_port_name",
-		".tags.service_type = m.service_type",
-		".tags.service_cluster_ip = m.service_cluster_ip",
-		".tags.service_external_name = m.service_external_name",
-		".tags.node_provider_id = m.node_provider_id",
-		".tags.endpoint_ready = m.endpoint_ready",
-		".tags.endpoint_hostname = m.endpoint_hostname",
-		".tags.endpoint_node_name = m.endpoint_node_name",
-		".tags.endpoint_zone = m.endpoint_zone",
-		".tags.endpoint_address_type = m.endpoint_address_type",
-		".tags.endpointslice_name = m.endpointslice_name",
-		".tags.ingress_class_name = m.ingress_class_name",
-		".tags.ingress_path = m.ingress_path",
-		".tags.ingress_scheme = m.ingress_scheme",
-		".tags = merge!(.tags, m.node_addresses)",
-	}
+var enrichLinesList = []string{
+	".tags.namespace = m.namespace",
+	".tags.pod = m.pod",
+	".tags.service = m.service",
+	".tags.node = m.node",
+	".tags.container = m.container",
+	".tags.job = m.job",
+	".tags.role = m.role",
+	".tags.pod_uid = m.pod_uid",
+	".tags.pod_phase = m.pod_phase",
+	".tags.pod_ready = m.pod_ready",
+	".tags.controller_kind = m.controller_kind",
+	".tags.controller_name = m.controller_name",
+	".tags.container_image = m.container_image",
+	".tags.container_id = m.container_id",
+	".tags.container_init = m.container_init",
+	".tags.host_ip = m.host_ip",
+	".tags.pod_ip = m.pod_ip",
+	".tags.node_ip = m.node_ip",
+	".tags.port_name = m.port_name",
+	".tags.port_number = m.port_number",
+	".tags.port_protocol = m.port_protocol",
+	".tags.service_port_name = m.service_port_name",
+	".tags.service_type = m.service_type",
+	".tags.service_cluster_ip = m.service_cluster_ip",
+	".tags.service_external_name = m.service_external_name",
+	".tags.node_provider_id = m.node_provider_id",
+	".tags.endpoint_ready = m.endpoint_ready",
+	".tags.endpoint_hostname = m.endpoint_hostname",
+	".tags.endpoint_node_name = m.endpoint_node_name",
+	".tags.endpoint_zone = m.endpoint_zone",
+	".tags.endpoint_address_type = m.endpoint_address_type",
+	".tags.endpointslice_name = m.endpointslice_name",
+	".tags.ingress_class_name = m.ingress_class_name",
+	".tags.ingress_path = m.ingress_path",
+	".tags.ingress_scheme = m.ingress_scheme",
+	".tags = merge!(.tags, m.node_addresses)",
 }
 
 func writeEntry(b *strings.Builder, instance string, t discovery.Target) {
-	fmt.Fprintf(b, "  %q: {", instance)
-	var parts []string
-	parts = appendStr(parts, "namespace", t.Namespace)
-	parts = appendStr(parts, "pod", t.Pod)
-	parts = appendStr(parts, "service", t.Service)
-	parts = appendStr(parts, "node", t.Node)
-	parts = appendStr(parts, "container", t.Container)
-	parts = appendStr(parts, "job", t.Job)
-	parts = appendStr(parts, "role", t.Role)
-	parts = appendStr(parts, "pod_uid", t.PodUID)
-	parts = appendStr(parts, "pod_phase", t.PodPhase)
-	parts = appendStr(parts, "pod_ready", t.PodReady)
-	parts = appendStr(parts, "controller_kind", t.ControllerKind)
-	parts = appendStr(parts, "controller_name", t.ControllerName)
-	parts = appendStr(parts, "container_image", t.ContainerImage)
-	parts = appendStr(parts, "container_id", t.ContainerID)
-	parts = appendStr(parts, "container_init", t.ContainerInit)
-	parts = appendStr(parts, "host_ip", t.HostIP)
-	parts = appendStr(parts, "pod_ip", t.PodIP)
-	parts = appendStr(parts, "node_ip", t.NodeIP)
-	parts = appendStr(parts, "port_name", t.PortName)
-	parts = appendStr(parts, "port_number", t.PortNumber)
-	parts = appendStr(parts, "port_protocol", t.PortProtocol)
-	parts = appendStr(parts, "service_port_name", t.ServicePortName)
-	parts = appendStr(parts, "service_type", t.ServiceType)
-	parts = appendStr(parts, "service_cluster_ip", t.ServiceClusterIP)
-	parts = appendStr(parts, "service_external_name", t.ServiceExternalName)
-	parts = appendStr(parts, "node_provider_id", t.NodeProviderID)
-	parts = appendStr(parts, "endpoint_ready", t.EndpointReady)
-	parts = appendStr(parts, "endpoint_hostname", t.EndpointHostname)
-	parts = appendStr(parts, "endpoint_node_name", t.EndpointNodeName)
-	parts = appendStr(parts, "endpoint_zone", t.EndpointZone)
-	parts = appendStr(parts, "endpoint_address_type", t.EndpointAddressType)
-	parts = appendStr(parts, "endpointslice_name", t.EndpointSliceName)
-	parts = appendStr(parts, "ingress_class_name", t.IngressClassName)
-	parts = appendStr(parts, "ingress_path", t.IngressPath)
-	parts = appendStr(parts, "ingress_scheme", t.IngressScheme)
+	b.WriteString("  ")
+	writeQuoted(b, instance)
+	b.WriteString(": {")
 
-	for i, p := range parts {
-		if i > 0 {
-			b.WriteString(", ")
+	sep := ""
+	field := func(key, val string) {
+		if val == "" {
+			return
 		}
-		b.WriteString(p)
+		b.WriteString(sep)
+		sep = ", "
+		writeQuoted(b, key)
+		b.WriteString(": ")
+		writeQuoted(b, val)
 	}
+	field("namespace", t.Namespace)
+	field("pod", t.Pod)
+	field("service", t.Service)
+	field("node", t.Node)
+	field("container", t.Container)
+	field("job", t.Job)
+	field("role", t.Role)
+	field("pod_uid", t.PodUID)
+	field("pod_phase", t.PodPhase)
+	field("pod_ready", t.PodReady)
+	field("controller_kind", t.ControllerKind)
+	field("controller_name", t.ControllerName)
+	field("container_image", t.ContainerImage)
+	field("container_id", t.ContainerID)
+	field("container_init", t.ContainerInit)
+	field("host_ip", t.HostIP)
+	field("pod_ip", t.PodIP)
+	field("node_ip", t.NodeIP)
+	field("port_name", t.PortName)
+	field("port_number", t.PortNumber)
+	field("port_protocol", t.PortProtocol)
+	field("service_port_name", t.ServicePortName)
+	field("service_type", t.ServiceType)
+	field("service_cluster_ip", t.ServiceClusterIP)
+	field("service_external_name", t.ServiceExternalName)
+	field("node_provider_id", t.NodeProviderID)
+	field("endpoint_ready", t.EndpointReady)
+	field("endpoint_hostname", t.EndpointHostname)
+	field("endpoint_node_name", t.EndpointNodeName)
+	field("endpoint_zone", t.EndpointZone)
+	field("endpoint_address_type", t.EndpointAddressType)
+	field("endpointslice_name", t.EndpointSliceName)
+	field("ingress_class_name", t.IngressClassName)
+	field("ingress_path", t.IngressPath)
+	field("ingress_scheme", t.IngressScheme)
+
+	b.WriteString(", \"node_addresses\": ")
 	if len(t.NodeAddresses) > 0 {
-		b.WriteString(", \"node_addresses\": {")
+		b.WriteByte('{')
 		first := true
 		for _, k := range sortedKeys(t.NodeAddresses) {
 			if !first {
 				b.WriteString(", ")
 			}
 			first = false
-			fmt.Fprintf(b, "%q: %q", "node_address_"+k, t.NodeAddresses[k])
+			b.WriteString(`"node_address_`)
+			b.WriteString(k)
+			b.WriteString(`": "`)
+			b.WriteString(t.NodeAddresses[k])
+			b.WriteByte('"')
 		}
-		b.WriteString("}")
+		b.WriteByte('}')
 	} else {
-		b.WriteString(", \"node_addresses\": {}")
+		b.WriteString("{}")
 	}
+	b.WriteString(", \"labels\": ")
 	if len(t.Labels) > 0 {
-		b.WriteString(", \"labels\": {")
+		b.WriteByte('{')
 		first := true
 		for _, k := range sortedKeys(t.Labels) {
 			if !first {
 				b.WriteString(", ")
 			}
 			first = false
-			fmt.Fprintf(b, "%q: %q", k, t.Labels[k])
+			writeQuoted(b, k)
+			b.WriteString(": ")
+			writeQuoted(b, t.Labels[k])
 		}
-		b.WriteString("}")
+		b.WriteByte('}')
 	} else {
-		b.WriteString(", \"labels\": {}")
+		b.WriteString("{}")
 	}
 	b.WriteString("},\n")
 }
 
-func appendStr(parts []string, key, val string) []string {
-	if val == "" {
-		return parts
+// writeQuoted writes a double-quoted string matching strconv.Quote output.
+// The common case (printable ASCII without quotes or backslashes) takes a
+// zero-allocation fast path; rare strings needing escapes fall back to
+// strconv.Quote.
+func writeQuoted(b *strings.Builder, s string) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' || c == '\\' || c < 0x20 || c >= 0x7f {
+			b.WriteString(strconv.Quote(s))
+			return
+		}
 	}
-	return append(parts, fmt.Sprintf("%q: %q", key, val))
+	b.WriteByte('"')
+	b.WriteString(s)
+	b.WriteByte('"')
 }
 
 func sortedKeys(m map[string]string) []string {
