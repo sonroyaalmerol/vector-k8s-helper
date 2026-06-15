@@ -312,7 +312,7 @@ func buildRemapSource(targets []discovery.Target, cfg Config) string {
 		b.WriteString(line)
 		b.WriteByte('\n')
 	}
-	b.WriteString("  .tags = merge(.tags, m.labels)\n")
+	b.WriteString("  .tags = merge!(.tags, m.labels)\n")
 	b.WriteString("}\n")
 
 	if cfg.ClusterLabel != "" {
@@ -370,7 +370,7 @@ func enrichLines() []string {
 		".tags.ingress_class_name = m.ingress_class_name",
 		".tags.ingress_path = m.ingress_path",
 		".tags.ingress_scheme = m.ingress_scheme",
-		".tags = merge(.tags, m.node_addresses)",
+		".tags = merge!(.tags, m.node_addresses)",
 	}
 }
 

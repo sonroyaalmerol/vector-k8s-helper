@@ -441,7 +441,7 @@ func TestRenderMetadataIncludesLabels(t *testing.T) {
 	if !strings.Contains(transform.Source, `"pod_label_app": "myapp"`) {
 		t.Errorf("expected pod label in metadata table, got:\n%s", transform.Source)
 	}
-	if !strings.Contains(transform.Source, ".tags = merge(.tags, m.labels)") {
+	if !strings.Contains(transform.Source, ".tags = merge!(.tags, m.labels)") {
 		t.Errorf("expected labels merge in remap, got:\n%s", transform.Source)
 	}
 }
