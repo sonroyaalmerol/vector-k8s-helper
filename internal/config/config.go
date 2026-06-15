@@ -32,6 +32,7 @@ type Config struct {
 	IncludeLabels      bool
 	NodeScrapePort     int32
 	ServiceDNSSuffix   string
+	NodeScoped         bool
 }
 
 type Roles struct {
@@ -115,6 +116,7 @@ func Load() (Config, error) {
 		IncludeLabels:      boolEnvOr("INCLUDE_LABELS", true),
 		NodeScrapePort:     int32EnvOr("NODE_SCRAPE_PORT", 10250),
 		ServiceDNSSuffix:   envOr("SERVICE_DNS_SUFFIX", "svc.cluster.local"),
+		NodeScoped:         boolEnvOr("NODE_SCOPED", false),
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)

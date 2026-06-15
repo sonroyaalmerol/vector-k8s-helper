@@ -73,6 +73,7 @@ func main() {
 		HonorLabels:        cfg.HonorLabels,
 		ClusterLabel:       cfg.ClusterLabel,
 		AdditionalLabels:   cfg.AdditionalLabels,
+		NodeScoped:         cfg.NodeScoped,
 	}
 
 	go func() {

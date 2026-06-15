@@ -15,6 +15,7 @@ type Config struct {
 	HonorLabels        bool
 	ClusterLabel       string
 	AdditionalLabels   map[string]string
+	NodeScoped         bool
 }
 
 type VectorSources struct {
@@ -306,6 +307,10 @@ func buildRemapSource(targets []discovery.Target, cfg Config) string {
 
 	var b strings.Builder
 	b.Grow(len(entries)*256 + 256)
+
+	if cfg.NodeScoped {
+		b.WriteString("if .tags.node != get_env_var!(\"VECTOR_SELF_NODE_NAME\") { abort }\n")
+	}
 
 	b.WriteString("inst = .tags.instance\n")
 	b.WriteString("m = get!(metadata, [inst])\n")
