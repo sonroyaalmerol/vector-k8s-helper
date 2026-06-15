@@ -64,6 +64,10 @@ func main() {
 
 	go serveHealth(ctx, cfg.MetricsAddr, logger)
 
+	if cfg.SidecarMode && cfg.SidecarNode != "" {
+		cfg.Selectors.PodField = "spec.nodeName=" + cfg.SidecarNode
+	}
+
 	w := discovery.NewWatcher(client, cfg, logger)
 	wr := writer.NewWriter(client, cfg.Namespace, cfg.ConfigMapKey, logger)
 
@@ -90,6 +94,18 @@ func main() {
 		content, err := renderer.Render(targets, rendCfg)
 		if err != nil {
 			logger.Error("failed to render config", "error", err)
+			continue
+		}
+
+		if cfg.SidecarMode {
+			if bytes.Equal(content, lastContent) {
+				logger.Debug("config unchanged, skipping write")
+				continue
+			}
+			lastContent = content
+			if err := os.WriteFile(cfg.SidecarOutput, content, 0o644); err != nil {
+				logger.Error("failed to write sidecar config", "error", err, "path", cfg.SidecarOutput)
+			}
 			continue
 		}
 

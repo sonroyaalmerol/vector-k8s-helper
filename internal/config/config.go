@@ -33,6 +33,9 @@ type Config struct {
 	NodeScrapePort     int32
 	ServiceDNSSuffix   string
 	NodeScoped         bool
+	SidecarMode        bool
+	SidecarOutput      string
+	SidecarNode        string
 }
 
 type Roles struct {
@@ -117,6 +120,9 @@ func Load() (Config, error) {
 		NodeScrapePort:     int32EnvOr("NODE_SCRAPE_PORT", 10250),
 		ServiceDNSSuffix:   envOr("SERVICE_DNS_SUFFIX", "svc.cluster.local"),
 		NodeScoped:         boolEnvOr("NODE_SCOPED", false),
+		SidecarMode:        boolEnvOr("SIDECAR", false),
+		SidecarOutput:      envOr("SIDECAR_OUTPUT", "/etc/vector/discovered/scrape_sources.yaml"),
+		SidecarNode:        os.Getenv("VECTOR_SELF_NODE_NAME"),
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
