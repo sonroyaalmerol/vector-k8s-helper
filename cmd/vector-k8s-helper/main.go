@@ -68,9 +68,6 @@ func main() {
 		cfg.Selectors.PodField = "spec.nodeName=" + cfg.SidecarNode
 	}
 
-	w := discovery.NewWatcher(client, cfg, logger)
-	wr := writer.NewWriter(client, cfg.Namespace, cfg.ConfigMapKey, logger)
-
 	rendCfg := renderer.Config{
 		ScrapeIntervalSecs: cfg.ScrapeInterval.Seconds(),
 		ScrapeTimeoutSecs:  cfg.ScrapeTimeout.Seconds(),
@@ -79,6 +76,18 @@ func main() {
 		AdditionalLabels:   cfg.AdditionalLabels,
 		NodeScoped:         cfg.NodeScoped,
 	}
+
+	if cfg.SidecarMode {
+		seed, err := renderer.RenderEmpty(rendCfg)
+		if err != nil {
+			logger.Error("failed to render seed config", "error", err)
+		} else if err := os.WriteFile(cfg.SidecarOutput, seed, 0o644); err != nil {
+			logger.Error("failed to write seed config", "error", err, "path", cfg.SidecarOutput)
+		}
+	}
+
+	w := discovery.NewWatcher(client, cfg, logger)
+	wr := writer.NewWriter(client, cfg.Namespace, cfg.ConfigMapKey, logger)
 
 	go func() {
 		if err := w.Run(ctx); err != nil && ctx.Err() == nil {
