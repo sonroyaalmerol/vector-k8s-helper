@@ -848,14 +848,14 @@ func targetsFromEndpoints(eps *corev1.Endpoints, svc *corev1.Service, cfg config
 
 	scheme := defaultStr(svc.Annotations[k.scheme], "http")
 	path := defaultStr(svc.Annotations[k.path], "/metrics")
+	scrapePortStr := svc.Annotations[k.port]
 
 	svcLbl, svcAnn := metadataMaps("endpoints", svc.Labels, svc.Annotations, cfg)
 
 	var targets []Target
 	for i := range eps.Subsets {
 		subset := &eps.Subsets[i]
-		for j := range subset.Ports {
-			sp := &subset.Ports[j]
+		for _, sp := range resolveSubsetPorts(subset.Ports, scrapePortStr) {
 			portNum := sp.Port
 			for _, addr := range subset.Addresses {
 				hostPort := net.JoinHostPort(addr.IP, strconv.Itoa(int(portNum)))
@@ -1120,6 +1120,22 @@ func resolveEndpointPorts(epSlice *discoveryv1.EndpointSlice, scrapePortStr stri
 	}
 	tp := int32(p)
 	return []discoveryv1.EndpointPort{{Port: &tp}}
+}
+
+func resolveSubsetPorts(ports []corev1.EndpointPort, scrapePortStr string) []corev1.EndpointPort {
+	if scrapePortStr == "" {
+		return ports
+	}
+	p, err := strconv.ParseInt(scrapePortStr, 10, 32)
+	if err != nil {
+		return nil
+	}
+	for i := range ports {
+		if ports[i].Port == int32(p) {
+			return []corev1.EndpointPort{ports[i]}
+		}
+	}
+	return []corev1.EndpointPort{{Port: int32(p)}}
 }
 
 func lookupPod(store cache.Store, namespace, name string) (*corev1.Pod, bool) {

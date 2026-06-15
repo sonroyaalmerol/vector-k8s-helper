@@ -665,6 +665,70 @@ func TestTargetsFromEndpoints(t *testing.T) {
 	}
 }
 
+func TestEndpointsScrapePortOverride(t *testing.T) {
+	cfg := defaultConfig()
+	k := defaultKeys()
+
+	eps := &corev1.Endpoints{ //nolint:staticcheck
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "multiport-svc",
+			Namespace: "default",
+		},
+		Subsets: []corev1.EndpointSubset{ //nolint:staticcheck
+			{
+				Addresses: []corev1.EndpointAddress{
+					{IP: "10.0.1.10"},
+				},
+				Ports: []corev1.EndpointPort{
+					{Port: 8080, Name: "http", Protocol: corev1.ProtocolTCP},
+					{Port: 9090, Name: "metrics", Protocol: corev1.ProtocolTCP},
+				},
+			},
+		},
+	}
+
+	t.Run("with_port_annotation", func(t *testing.T) {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "multiport-svc",
+				Namespace: "default",
+				Annotations: map[string]string{
+					"prometheus.io/scrape": "true",
+					"prometheus.io/port":   "9090",
+				},
+			},
+			Spec: corev1.ServiceSpec{ClusterIP: "10.96.0.60"},
+		}
+		targets := targetsFromEndpoints(eps, svc, cfg, k, nil, nil, nil)
+		if len(targets) != 1 {
+			t.Fatalf("expected 1 target (annotated port), got %d", len(targets))
+		}
+		if targets[0].URL != "http://10.0.1.10:9090/metrics" {
+			t.Errorf("URL = %q, want http://10.0.1.10:9090/metrics", targets[0].URL)
+		}
+		if targets[0].PortName != "metrics" {
+			t.Errorf("PortName = %q, want metrics", targets[0].PortName)
+		}
+	})
+
+	t.Run("without_port_annotation", func(t *testing.T) {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "multiport-svc",
+				Namespace: "default",
+				Annotations: map[string]string{
+					"prometheus.io/scrape": "true",
+				},
+			},
+			Spec: corev1.ServiceSpec{ClusterIP: "10.96.0.60"},
+		}
+		targets := targetsFromEndpoints(eps, svc, cfg, k, nil, nil, nil)
+		if len(targets) != 2 {
+			t.Fatalf("expected 2 targets (all subset ports), got %d", len(targets))
+		}
+	})
+}
+
 func TestPodPerPortMetadata(t *testing.T) {
 	cfg := defaultConfig()
 	k := defaultKeys()
