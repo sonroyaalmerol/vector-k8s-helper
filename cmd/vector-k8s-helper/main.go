@@ -88,7 +88,13 @@ func main() {
 
 	var lastContent []byte
 	for targets := range w.Output() {
-		logger.Info("targets changed", "count", len(targets))
+		logger.Info("targets changed",
+			"total", len(targets),
+			"by_role", discovery.SummarizeTargets(targets).ByRole,
+			"namespaces", discovery.SummarizeTargets(targets).Namespaces,
+			"sources", discovery.SummarizeTargets(targets).Sources,
+			"sample", discovery.SummarizeTargets(targets).Sample,
+		)
 
 		content, err := renderer.Render(targets, rendCfg)
 		if err != nil {

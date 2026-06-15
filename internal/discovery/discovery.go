@@ -88,6 +88,36 @@ type Target struct {
 	Annotations map[string]string
 }
 
+
+type TargetSummary struct {
+	Total      int
+	ByRole     map[string]int
+	Namespaces map[string]int
+	Sources    int
+	Sample     []string
+}
+
+func SummarizeTargets(targets []Target) TargetSummary {
+	s := TargetSummary{
+		Total:      len(targets),
+		ByRole:     make(map[string]int),
+		Namespaces: make(map[string]int),
+	}
+	sources := make(map[string]bool)
+	sampleN := min(len(targets), 3)
+	s.Sample = make([]string, 0, sampleN)
+	for i, t := range targets {
+		s.ByRole[t.Role]++
+		s.Namespaces[t.Namespace]++
+		sources[t.URL] = true
+		if i < sampleN {
+			s.Sample = append(s.Sample, t.URL)
+		}
+	}
+	s.Sources = len(sources)
+	return s
+}
+
 type keys struct {
 	scrape    string
 	port      string
