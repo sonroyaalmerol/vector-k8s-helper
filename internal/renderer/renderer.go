@@ -146,6 +146,35 @@ func RenderEmpty(cfg Config) ([]byte, error) {
 	return out, nil
 }
 
+func RenderPerNode(targets []discovery.Target, cfg Config) (map[string][]byte, error) {
+	out := make(map[string][]byte)
+
+	empty, err := RenderEmpty(cfg)
+	if err != nil {
+		return nil, err
+	}
+	out["_empty.yaml"] = empty
+
+	if len(targets) == 0 {
+		return out, nil
+	}
+
+	byNode := make(map[string][]discovery.Target)
+	for _, t := range targets {
+		byNode[t.Node] = append(byNode[t.Node], t)
+	}
+
+	for node, t := range byNode {
+		data, err := Render(t, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("node %q: %w", node, err)
+		}
+		out[node+".yaml"] = data
+	}
+
+	return out, nil
+}
+
 type sourceGroupKey struct {
 	scheme         string
 	path           string

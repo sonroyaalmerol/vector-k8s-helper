@@ -36,10 +36,25 @@ func (w *Writer) Upsert(ctx context.Context, name string, content []byte) error 
 	if w.namespace == "" {
 		return fmt.Errorf("namespace must be set for ConfigMap operations")
 	}
+	cmClient := w.client.CoreV1().ConfigMaps(w.namespace)
+	patch, err := buildPatch(w.configMapKey, content)
+	if err != nil {
+		return fmt.Errorf("failed to encode configmap patch: %w", err)
+	}
+	return w.retryApply(ctx, cmClient, name, content, patch)
+}
 
+func (w *Writer) UpsertMulti(ctx context.Context, name string, entries map[string][]byte) error {
+	if w.namespace == "" {
+		return fmt.Errorf("namespace must be set for ConfigMap operations")
+	}
 	cmClient := w.client.CoreV1().ConfigMaps(w.namespace)
 
-	patch, err := buildPatch(w.configMapKey, content)
+	data := make(map[string]string, len(entries))
+	for k, v := range entries {
+		data[k] = string(v)
+	}
+	patch, err := buildMultiPatch(data)
 	if err != nil {
 		return fmt.Errorf("failed to encode configmap patch: %w", err)
 	}
@@ -47,7 +62,67 @@ func (w *Writer) Upsert(ctx context.Context, name string, content []byte) error 
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err = w.apply(ctx, cmClient, name, content, patch)
+		_, getErr := cmClient.Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			if !apierrors.IsNotFound(getErr) {
+				if !shouldRetry(getErr) || attempt == maxAttempts {
+					return getErr
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
+				}
+				continue
+			}
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: w.namespace,
+				},
+				Data: data,
+			}
+			_, err = cmClient.Create(ctx, cm, metav1.CreateOptions{})
+			if err != nil {
+				lastErr = err
+				if !shouldRetry(err) || attempt == maxAttempts {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
+				}
+				continue
+			}
+			w.logger.Info("created configmap", "namespace", w.namespace, "name", name)
+			return nil
+		}
+
+		_, err = cmClient.Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
+		if err != nil {
+			lastErr = err
+			if !shouldRetry(err) || attempt == maxAttempts {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
+			}
+			continue
+		}
+		w.logger.Info("updated configmap", "namespace", w.namespace, "name", name, "keys", len(entries))
+		return nil
+	}
+	return fmt.Errorf("failed to write configmap %s/%s: %w", w.namespace, name, lastErr)
+}
+
+func (w *Writer) retryApply(ctx context.Context, cmClient corev1client.ConfigMapInterface, name string, content []byte, patch []byte) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := w.apply(ctx, cmClient, name, content, patch)
 		if err == nil {
 			return nil
 		}
@@ -112,6 +187,10 @@ func buildPatch(key string, content []byte) ([]byte, error) {
 		},
 	}
 	return json.Marshal(body)
+}
+
+func buildMultiPatch(entries map[string]string) ([]byte, error) {
+	return json.Marshal(map[string]any{"data": entries})
 }
 
 func isTransientNet(err error) bool {

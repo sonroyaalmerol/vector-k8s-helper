@@ -86,6 +86,22 @@ func main() {
 	for targets := range w.Output() {
 		logger.Info("targets changed", "count", len(targets))
 
+		writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+
+		if cfg.MetricsDistribution == "per_node" {
+			entries, err := renderer.RenderPerNode(targets, rendCfg)
+			if err != nil {
+				logger.Error("failed to render per-node config", "error", err)
+				cancel()
+				continue
+			}
+			if err := wr.UpsertMulti(writeCtx, cfg.ConfigMapName, entries); err != nil {
+				logger.Error("failed to write configmap", "error", err)
+			}
+			cancel()
+			continue
+		}
+
 		content, err := renderer.Render(targets, rendCfg)
 		if err != nil {
 			logger.Error("failed to render config", "error", err)
@@ -98,7 +114,7 @@ func main() {
 		}
 		lastContent = content
 
-		writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		writeCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
 		if err := wr.Upsert(writeCtx, cfg.ConfigMapName, content); err != nil {
 			logger.Error("failed to write configmap", "error", err)
 		}

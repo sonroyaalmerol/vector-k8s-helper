@@ -23,15 +23,16 @@ type Config struct {
 	AdditionalLabels map[string]string
 	AnnotationPrefix string
 
-	Roles              Roles
-	Selectors          Selectors
-	Namespaces         NamespaceFilter
-	AttachNodeMetadata bool
-	AttachNsMetadata   bool
-	IncludeAnnotations bool
-	IncludeLabels      bool
-	NodeScrapePort     int32
-	ServiceDNSSuffix   string
+	Roles               Roles
+	Selectors           Selectors
+	Namespaces          NamespaceFilter
+	AttachNodeMetadata  bool
+	AttachNsMetadata    bool
+	IncludeAnnotations  bool
+	IncludeLabels       bool
+	NodeScrapePort      int32
+	ServiceDNSSuffix    string
+	MetricsDistribution string
 }
 
 type Roles struct {
@@ -106,15 +107,16 @@ func Load() (Config, error) {
 		AdditionalLabels: labelsEnvOr("ADDITIONAL_LABELS"),
 		AnnotationPrefix: envOr("ANNOTATION_PREFIX", defaultAnnotationPrefix),
 
-		Roles:              parseRoles(envOr("ROLES", "pod,endpointslice")),
-		Selectors:          parseSelectors(),
-		Namespaces:         parseNamespaces(envOr("NAMESPACE_INCLUDE", ""), envOr("NAMESPACE_EXCLUDE", "")),
-		AttachNodeMetadata: boolEnvOr("ATTACH_NODE_METADATA", false),
-		AttachNsMetadata:   boolEnvOr("ATTACH_NAMESPACE_METADATA", false),
-		IncludeAnnotations: boolEnvOr("INCLUDE_ANNOTATIONS", false),
-		IncludeLabels:      boolEnvOr("INCLUDE_LABELS", true),
-		NodeScrapePort:     int32EnvOr("NODE_SCRAPE_PORT", 10250),
-		ServiceDNSSuffix:   envOr("SERVICE_DNS_SUFFIX", "svc.cluster.local"),
+		Roles:               parseRoles(envOr("ROLES", "pod,endpointslice")),
+		Selectors:           parseSelectors(),
+		Namespaces:          parseNamespaces(envOr("NAMESPACE_INCLUDE", ""), envOr("NAMESPACE_EXCLUDE", "")),
+		AttachNodeMetadata:  boolEnvOr("ATTACH_NODE_METADATA", false),
+		AttachNsMetadata:    boolEnvOr("ATTACH_NAMESPACE_METADATA", false),
+		IncludeAnnotations:  boolEnvOr("INCLUDE_ANNOTATIONS", false),
+		IncludeLabels:       boolEnvOr("INCLUDE_LABELS", true),
+		NodeScrapePort:      int32EnvOr("NODE_SCRAPE_PORT", 10250),
+		ServiceDNSSuffix:    envOr("SERVICE_DNS_SUFFIX", "svc.cluster.local"),
+		MetricsDistribution: envOr("METRICS_DISTRIBUTION", "central"),
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
