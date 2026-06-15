@@ -213,11 +213,11 @@ func (w *Watcher) buildInformers() map[string]cache.SharedInformer {
 		out["pod"] = w.newInformer(
 			func(o metav1.ListOptions) (runtime.Object, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.PodLabel, w.cfg.Selectors.PodField
-				return w.client.CoreV1().Pods(w.cfg.Namespace).List(w.ctx, o)
+				return w.client.CoreV1().Pods("").List(w.ctx, o)
 			},
 			func(o metav1.ListOptions) (watch.Interface, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.PodLabel, w.cfg.Selectors.PodField
-				return w.client.CoreV1().Pods(w.cfg.Namespace).Watch(w.ctx, o)
+				return w.client.CoreV1().Pods("").Watch(w.ctx, o)
 			},
 			&corev1.Pod{}, func(s cache.Store) { w.podStore = s })
 	}
@@ -225,11 +225,11 @@ func (w *Watcher) buildInformers() map[string]cache.SharedInformer {
 		out["service"] = w.newInformer(
 			func(o metav1.ListOptions) (runtime.Object, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.ServiceLabel, w.cfg.Selectors.ServiceField
-				return w.client.CoreV1().Services(w.cfg.Namespace).List(w.ctx, o)
+				return w.client.CoreV1().Services("").List(w.ctx, o)
 			},
 			func(o metav1.ListOptions) (watch.Interface, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.ServiceLabel, w.cfg.Selectors.ServiceField
-				return w.client.CoreV1().Services(w.cfg.Namespace).Watch(w.ctx, o)
+				return w.client.CoreV1().Services("").Watch(w.ctx, o)
 			},
 			&corev1.Service{}, func(s cache.Store) { w.svcStore = s })
 	}
@@ -237,11 +237,11 @@ func (w *Watcher) buildInformers() map[string]cache.SharedInformer {
 		out["endpointslice"] = w.newInformer(
 			func(o metav1.ListOptions) (runtime.Object, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.EndpointSliceLabel, w.cfg.Selectors.EndpointSliceField
-				return w.client.DiscoveryV1().EndpointSlices(w.cfg.Namespace).List(w.ctx, o)
+				return w.client.DiscoveryV1().EndpointSlices("").List(w.ctx, o)
 			},
 			func(o metav1.ListOptions) (watch.Interface, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.EndpointSliceLabel, w.cfg.Selectors.EndpointSliceField
-				return w.client.DiscoveryV1().EndpointSlices(w.cfg.Namespace).Watch(w.ctx, o)
+				return w.client.DiscoveryV1().EndpointSlices("").Watch(w.ctx, o)
 			},
 			&discoveryv1.EndpointSlice{}, func(s cache.Store) { w.epStore = s })
 	}
@@ -249,11 +249,11 @@ func (w *Watcher) buildInformers() map[string]cache.SharedInformer {
 		out["endpoints"] = w.newInformer(
 			func(o metav1.ListOptions) (runtime.Object, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.EndpointsLabel, w.cfg.Selectors.EndpointsField
-				return w.client.CoreV1().Endpoints(w.cfg.Namespace).List(w.ctx, o)
+				return w.client.CoreV1().Endpoints("").List(w.ctx, o)
 			},
 			func(o metav1.ListOptions) (watch.Interface, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.EndpointsLabel, w.cfg.Selectors.EndpointsField
-				return w.client.CoreV1().Endpoints(w.cfg.Namespace).Watch(w.ctx, o)
+				return w.client.CoreV1().Endpoints("").Watch(w.ctx, o)
 			},
 			&corev1.Endpoints{}, func(s cache.Store) { w.endpointsStore = s }) //nolint:staticcheck // legacy endpoints role for parity
 	}
@@ -273,11 +273,11 @@ func (w *Watcher) buildInformers() map[string]cache.SharedInformer {
 		out["ingress"] = w.newInformer(
 			func(o metav1.ListOptions) (runtime.Object, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.IngressLabel, w.cfg.Selectors.IngressField
-				return w.client.NetworkingV1().Ingresses(w.cfg.Namespace).List(w.ctx, o)
+				return w.client.NetworkingV1().Ingresses("").List(w.ctx, o)
 			},
 			func(o metav1.ListOptions) (watch.Interface, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.IngressLabel, w.cfg.Selectors.IngressField
-				return w.client.NetworkingV1().Ingresses(w.cfg.Namespace).Watch(w.ctx, o)
+				return w.client.NetworkingV1().Ingresses("").Watch(w.ctx, o)
 			},
 			&netv1.Ingress{}, func(s cache.Store) { w.ingressStore = s })
 	}

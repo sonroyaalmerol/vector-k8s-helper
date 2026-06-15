@@ -118,6 +118,7 @@ func Render(targets []discovery.Target, cfg Config) ([]byte, error) {
 }
 
 func RenderEmpty(cfg Config) ([]byte, error) {
+	sourceNames := []string{"no_targets"}
 	result := VectorSources{
 		Sources: map[string]SourceConfig{
 			"no_targets": {
@@ -125,6 +126,13 @@ func RenderEmpty(cfg Config) ([]byte, error) {
 				Endpoints:          []string{},
 				ScrapeIntervalSecs: cfg.ScrapeIntervalSecs,
 				ScrapeTimeoutSecs:  cfg.ScrapeTimeoutSecs,
+			},
+		},
+		Transforms: map[string]TransformConfig{
+			"enrich_metrics": {
+				Type:   "remap",
+				Inputs: sourceNames,
+				Source: buildRemapSource(nil, cfg),
 			},
 		},
 	}
