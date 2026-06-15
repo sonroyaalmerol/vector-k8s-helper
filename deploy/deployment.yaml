@@ -76,9 +76,13 @@ spec:
             - name: CLUSTER_LABEL
               value: ""
             - name: ROLES
-              value: "pod,endpointslice,node,ingress,service"
+              value: "pod,endpointslice,endpoints,node,ingress,service"
             - name: DEBOUNCE_INTERVAL
               value: "250ms"
+            - name: NAMESPACE_INCLUDE
+              value: ""
+            - name: NAMESPACE_EXCLUDE
+              value: "kube-system"
             - name: INCLUDE_LABELS
               value: "true"
             - name: INCLUDE_ANNOTATIONS

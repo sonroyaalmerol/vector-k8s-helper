@@ -336,14 +336,33 @@ func enrichLines() []string {
 		".tags.role = m.role",
 		".tags.pod_uid = m.pod_uid",
 		".tags.pod_phase = m.pod_phase",
+		".tags.pod_ready = m.pod_ready",
 		".tags.controller_kind = m.controller_kind",
 		".tags.controller_name = m.controller_name",
 		".tags.container_image = m.container_image",
 		".tags.container_id = m.container_id",
+		".tags.container_init = m.container_init",
 		".tags.host_ip = m.host_ip",
 		".tags.pod_ip = m.pod_ip",
 		".tags.node_ip = m.node_ip",
+		".tags.port_name = m.port_name",
+		".tags.port_number = m.port_number",
+		".tags.port_protocol = m.port_protocol",
 		".tags.service_port_name = m.service_port_name",
+		".tags.service_type = m.service_type",
+		".tags.service_cluster_ip = m.service_cluster_ip",
+		".tags.service_external_name = m.service_external_name",
+		".tags.node_provider_id = m.node_provider_id",
+		".tags.endpoint_ready = m.endpoint_ready",
+		".tags.endpoint_hostname = m.endpoint_hostname",
+		".tags.endpoint_node_name = m.endpoint_node_name",
+		".tags.endpoint_zone = m.endpoint_zone",
+		".tags.endpoint_address_type = m.endpoint_address_type",
+		".tags.endpointslice_name = m.endpointslice_name",
+		".tags.ingress_class_name = m.ingress_class_name",
+		".tags.ingress_path = m.ingress_path",
+		".tags.ingress_scheme = m.ingress_scheme",
+		".tags = merge(.tags, m.node_addresses)",
 	}
 }
 
@@ -359,20 +378,52 @@ func writeEntry(b *strings.Builder, instance string, t discovery.Target) {
 	parts = appendStr(parts, "role", t.Role)
 	parts = appendStr(parts, "pod_uid", t.PodUID)
 	parts = appendStr(parts, "pod_phase", t.PodPhase)
+	parts = appendStr(parts, "pod_ready", t.PodReady)
 	parts = appendStr(parts, "controller_kind", t.ControllerKind)
 	parts = appendStr(parts, "controller_name", t.ControllerName)
 	parts = appendStr(parts, "container_image", t.ContainerImage)
 	parts = appendStr(parts, "container_id", t.ContainerID)
+	parts = appendStr(parts, "container_init", t.ContainerInit)
 	parts = appendStr(parts, "host_ip", t.HostIP)
 	parts = appendStr(parts, "pod_ip", t.PodIP)
 	parts = appendStr(parts, "node_ip", t.NodeIP)
+	parts = appendStr(parts, "port_name", t.PortName)
+	parts = appendStr(parts, "port_number", t.PortNumber)
+	parts = appendStr(parts, "port_protocol", t.PortProtocol)
 	parts = appendStr(parts, "service_port_name", t.ServicePortName)
+	parts = appendStr(parts, "service_type", t.ServiceType)
+	parts = appendStr(parts, "service_cluster_ip", t.ServiceClusterIP)
+	parts = appendStr(parts, "service_external_name", t.ServiceExternalName)
+	parts = appendStr(parts, "node_provider_id", t.NodeProviderID)
+	parts = appendStr(parts, "endpoint_ready", t.EndpointReady)
+	parts = appendStr(parts, "endpoint_hostname", t.EndpointHostname)
+	parts = appendStr(parts, "endpoint_node_name", t.EndpointNodeName)
+	parts = appendStr(parts, "endpoint_zone", t.EndpointZone)
+	parts = appendStr(parts, "endpoint_address_type", t.EndpointAddressType)
+	parts = appendStr(parts, "endpointslice_name", t.EndpointSliceName)
+	parts = appendStr(parts, "ingress_class_name", t.IngressClassName)
+	parts = appendStr(parts, "ingress_path", t.IngressPath)
+	parts = appendStr(parts, "ingress_scheme", t.IngressScheme)
 
 	for i, p := range parts {
 		if i > 0 {
 			b.WriteString(", ")
 		}
 		b.WriteString(p)
+	}
+	if len(t.NodeAddresses) > 0 {
+		b.WriteString(", \"node_addresses\": {")
+		first := true
+		for _, k := range sortedKeys(t.NodeAddresses) {
+			if !first {
+				b.WriteString(", ")
+			}
+			first = false
+			fmt.Fprintf(b, "%q: %q", "node_address_"+k, t.NodeAddresses[k])
+		}
+		b.WriteString("}")
+	} else {
+		b.WriteString(", \"node_addresses\": {}")
 	}
 	if len(t.Labels) > 0 {
 		b.WriteString(", \"labels\": {")

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ type Config struct {
 
 	Roles              Roles
 	Selectors          Selectors
+	Namespaces         NamespaceFilter
 	AttachNodeMetadata bool
 	AttachNsMetadata   bool
 	IncludeAnnotations bool
@@ -34,6 +36,7 @@ type Config struct {
 
 type Roles struct {
 	Pod            bool
+	Endpoints      bool
 	EndpointSlice  bool
 	Node           bool
 	Ingress        bool
@@ -51,6 +54,13 @@ type Selectors struct {
 	IngressField       string
 	EndpointSliceLabel string
 	EndpointSliceField string
+	EndpointsLabel     string
+	EndpointsField     string
+}
+
+type NamespaceFilter struct {
+	Include []string
+	Exclude []string
 }
 
 const (
@@ -98,6 +108,7 @@ func Load() (Config, error) {
 
 		Roles:              parseRoles(envOr("ROLES", "pod,endpointslice")),
 		Selectors:          parseSelectors(),
+		Namespaces:         parseNamespaces(envOr("NAMESPACE_INCLUDE", ""), envOr("NAMESPACE_EXCLUDE", "")),
 		AttachNodeMetadata: boolEnvOr("ATTACH_NODE_METADATA", false),
 		AttachNsMetadata:   boolEnvOr("ATTACH_NAMESPACE_METADATA", false),
 		IncludeAnnotations: boolEnvOr("INCLUDE_ANNOTATIONS", false),
@@ -136,6 +147,8 @@ func parseRoles(v string) Roles {
 		switch strings.ToLower(strings.TrimSpace(p)) {
 		case "pod":
 			r.Pod = true
+		case "endpoints":
+			r.Endpoints = true
 		case "endpointslice":
 			r.EndpointSlice = true
 		case "node":
@@ -146,7 +159,7 @@ func parseRoles(v string) Roles {
 			r.ServiceAddress = true
 		}
 	}
-	if !r.Pod && !r.EndpointSlice && !r.Node && !r.Ingress && !r.ServiceAddress {
+	if !r.Pod && !r.Endpoints && !r.EndpointSlice && !r.Node && !r.Ingress && !r.ServiceAddress {
 		r.Pod = true
 		r.EndpointSlice = true
 	}
@@ -165,17 +178,22 @@ func parseSelectors() Selectors {
 		IngressField:       envOr("INGRESS_FIELD_SELECTOR", ""),
 		EndpointSliceLabel: envOr("ENDPOINTSLICE_LABEL_SELECTOR", ""),
 		EndpointSliceField: envOr("ENDPOINTSLICE_FIELD_SELECTOR", ""),
+		EndpointsLabel:     envOr("ENDPOINTS_LABEL_SELECTOR", ""),
+		EndpointsField:     envOr("ENDPOINTS_FIELD_SELECTOR", ""),
 	}
 }
 
 func (r Roles) Any() bool {
-	return r.Pod || r.EndpointSlice || r.Node || r.Ingress || r.ServiceAddress
+	return r.Pod || r.Endpoints || r.EndpointSlice || r.Node || r.Ingress || r.ServiceAddress
 }
 
 func (r Roles) Slice() []string {
 	var out []string
 	if r.Pod {
 		out = append(out, "pod")
+	}
+	if r.Endpoints {
+		out = append(out, "endpoints")
 	}
 	if r.EndpointSlice {
 		out = append(out, "endpointslice")
@@ -277,4 +295,36 @@ func ParseBool(s string, fallback bool) bool {
 		return fallback
 	}
 	return b
+}
+
+func parseNamespaces(include, exclude string) NamespaceFilter {
+	return NamespaceFilter{
+		Include: splitCSV(include),
+		Exclude: splitCSV(exclude),
+	}
+}
+
+func (nf NamespaceFilter) Allowed(namespace string) bool {
+	if slices.Contains(nf.Exclude, namespace) {
+		return false
+	}
+	if len(nf.Include) == 0 {
+		return true
+	}
+	return slices.Contains(nf.Include, namespace)
+}
+
+func splitCSV(v string) []string {
+	if v == "" {
+		return nil
+	}
+	parts := strings.SplitSeq(v, ",")
+	var out []string
+	for p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

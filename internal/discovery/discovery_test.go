@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -441,7 +442,9 @@ func TestTargetsFromEndpointSlice(t *testing.T) {
 					},
 				},
 			},
-			want: 0,
+			want:    1,
+			wantURL: "http://10.0.0.1:8080/metrics",
+			wantSvc: "notready",
 		},
 		{
 			name: "service_with_https_and_custom_path",
@@ -602,6 +605,305 @@ func TestTargetsFromIngress(t *testing.T) {
 	}
 	if targets[0].Role != "ingress" {
 		t.Errorf("Role = %q, want ingress", targets[0].Role)
+	}
+}
+
+func TestTargetsFromEndpoints(t *testing.T) {
+	cfg := defaultConfig()
+	k := defaultKeys()
+
+	eps := &corev1.Endpoints{ //nolint:staticcheck
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myapp",
+			Namespace: "production",
+		},
+		Subsets: []corev1.EndpointSubset{ //nolint:staticcheck
+			{
+				Addresses: []corev1.EndpointAddress{
+					{IP: "10.0.1.5", TargetRef: &corev1.ObjectReference{Kind: "Pod", Name: "myapp-abc"}},
+				},
+				Ports: []corev1.EndpointPort{
+					{Port: 9090, Name: "metrics", Protocol: corev1.ProtocolTCP},
+				},
+			},
+		},
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myapp",
+			Namespace: "production",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+				"prometheus.io/port":   "9090",
+			},
+		},
+		Spec: corev1.ServiceSpec{ClusterIP: "10.96.0.50"},
+	}
+
+	targets := targetsFromEndpoints(eps, svc, cfg, k, nil, nil, nil)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	tgt := targets[0]
+	if tgt.URL != "http://10.0.1.5:9090/metrics" {
+		t.Errorf("URL = %q", tgt.URL)
+	}
+	if tgt.Role != "endpoints" {
+		t.Errorf("Role = %q, want endpoints", tgt.Role)
+	}
+	if tgt.PortName != "metrics" {
+		t.Errorf("PortName = %q, want metrics", tgt.PortName)
+	}
+	if tgt.PortProtocol != "TCP" {
+		t.Errorf("PortProtocol = %q, want TCP", tgt.PortProtocol)
+	}
+	if tgt.EndpointReady != "true" {
+		t.Errorf("EndpointReady = %q, want true", tgt.EndpointReady)
+	}
+	if tgt.Pod != "myapp-abc" {
+		t.Errorf("Pod = %q, want myapp-abc", tgt.Pod)
+	}
+}
+
+func TestPodPerPortMetadata(t *testing.T) {
+	cfg := defaultConfig()
+	k := defaultKeys()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "multiport",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "web",
+					Ports: []corev1.ContainerPort{
+						{Name: "http", ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
+						{Name: "grpc", ContainerPort: 9090, Protocol: corev1.ProtocolTCP},
+					},
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			PodIP:      "10.0.0.21",
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	targets := targetsFromPod(pod, cfg, k)
+	if len(targets) != 2 {
+		t.Fatalf("expected 2 targets, got %d", len(targets))
+	}
+	httpT := targets[0]
+	if httpT.PortName != "http" {
+		t.Errorf("first port name = %q, want http", httpT.PortName)
+	}
+	if httpT.PortNumber != "8080" {
+		t.Errorf("first port number = %q, want 8080", httpT.PortNumber)
+	}
+	if httpT.PortProtocol != "TCP" {
+		t.Errorf("first port protocol = %q, want TCP", httpT.PortProtocol)
+	}
+	if httpT.Container != "web" {
+		t.Errorf("container = %q, want web", httpT.Container)
+	}
+	if httpT.PodReady != "True" {
+		t.Errorf("PodReady = %q, want True", httpT.PodReady)
+	}
+	grpcT := targets[1]
+	if grpcT.PortName != "grpc" {
+		t.Errorf("second port name = %q, want grpc", grpcT.PortName)
+	}
+	if grpcT.PortNumber != "9090" {
+		t.Errorf("second port number = %q, want 9090", grpcT.PortNumber)
+	}
+}
+
+func TestPodLabelPresent(t *testing.T) {
+	cfg := defaultConfig()
+	k := defaultKeys()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "labeled",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "myapp"},
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: "app", Ports: []corev1.ContainerPort{{ContainerPort: 9090}}},
+			},
+		},
+		Status: corev1.PodStatus{PodIP: "10.0.0.5"},
+	}
+
+	targets := targetsFromPod(pod, cfg, k)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	if v, ok := targets[0].Labels["pod_label_app"]; !ok || v != "myapp" {
+		t.Errorf("pod_label_app = %q ok=%v, want myapp", v, ok)
+	}
+	if v, ok := targets[0].Labels["pod_labelpresent_app"]; !ok || v != "true" {
+		t.Errorf("pod_labelpresent_app = %q ok=%v, want true", v, ok)
+	}
+}
+
+func TestServiceTypeMetadata(t *testing.T) {
+	cfg := defaultConfig()
+	k := defaultKeys()
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "external",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+				"prometheus.io/port":   "443",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:         corev1.ServiceTypeExternalName,
+			ExternalName: "external.example.com",
+			Ports: []corev1.ServicePort{
+				{Port: 443, Name: "https", Protocol: corev1.ProtocolTCP},
+			},
+		},
+	}
+
+	targets := targetsFromService(svc, cfg, k, nil)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	tgt := targets[0]
+	if tgt.ServiceType != "ExternalName" {
+		t.Errorf("ServiceType = %q, want ExternalName", tgt.ServiceType)
+	}
+	if tgt.ServiceExternalName != "external.example.com" {
+		t.Errorf("ServiceExternalName = %q", tgt.ServiceExternalName)
+	}
+	if !strings.Contains(tgt.URL, "external.example.com") {
+		t.Errorf("URL = %q, expected external.example.com host", tgt.URL)
+	}
+	if tgt.PortProtocol != "TCP" {
+		t.Errorf("PortProtocol = %q, want TCP", tgt.PortProtocol)
+	}
+}
+
+func TestNodeProviderAndAddresses(t *testing.T) {
+	cfg := config.Config{AnnotationPrefix: "prometheus.io", IncludeLabels: true, NodeScrapePort: 10250}
+	k := buildKeys(cfg)
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+			},
+		},
+		Spec: corev1.NodeSpec{ProviderID: "aws:///us-east-1a/i-abc123"},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: corev1.NodeExternalIP, Address: "1.2.3.4"},
+				{Type: corev1.NodeHostName, Address: "node-1.example.com"},
+			},
+		},
+	}
+
+	targets := targetsFromNode(node, cfg, k)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	tgt := targets[0]
+	if tgt.NodeProviderID != "aws:///us-east-1a/i-abc123" {
+		t.Errorf("NodeProviderID = %q", tgt.NodeProviderID)
+	}
+	if tgt.NodeAddresses["internalip"] != "10.0.0.1" {
+		t.Errorf("NodeAddresses internalip = %q", tgt.NodeAddresses["internalip"])
+	}
+	if tgt.NodeAddresses["externalip"] != "1.2.3.4" {
+		t.Errorf("NodeAddresses externalip = %q", tgt.NodeAddresses["externalip"])
+	}
+	if tgt.NodeAddresses["hostname"] != "node-1.example.com" {
+		t.Errorf("NodeAddresses hostname = %q", tgt.NodeAddresses["hostname"])
+	}
+}
+
+func TestIngressPathAndClass(t *testing.T) {
+	cfg := defaultConfig()
+	k := defaultKeys()
+
+	className := "nginx"
+	ing := &netv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mying",
+			Namespace: "production",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+			},
+		},
+		Spec: netv1.IngressSpec{
+			IngressClassName: &className,
+			TLS:              []netv1.IngressTLS{{}},
+			Rules: []netv1.IngressRule{
+				{
+					Host: "example.com",
+					IngressRuleValue: netv1.IngressRuleValue{
+						HTTP: &netv1.HTTPIngressRuleValue{
+							Paths: []netv1.HTTPIngressPath{{Path: "/api"}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	targets := targetsFromIngress(ing, cfg, k)
+	if len(targets) != 1 {
+		t.Fatalf("expected 1 target, got %d", len(targets))
+	}
+	tgt := targets[0]
+	if tgt.IngressClassName != "nginx" {
+		t.Errorf("IngressClassName = %q, want nginx", tgt.IngressClassName)
+	}
+	if tgt.IngressPath != "/api" {
+		t.Errorf("IngressPath = %q, want /api", tgt.IngressPath)
+	}
+	if tgt.IngressScheme != "https" {
+		t.Errorf("IngressScheme = %q, want https", tgt.IngressScheme)
+	}
+}
+
+func TestNamespaceFilter(t *testing.T) {
+	nf := config.NamespaceFilter{
+		Include: []string{"prod", "staging"},
+		Exclude: []string{"kube-system"},
+	}
+	if !nf.Allowed("prod") {
+		t.Error("prod should be allowed")
+	}
+	if nf.Allowed("default") {
+		t.Error("default should be denied (not in include list)")
+	}
+	if nf.Allowed("kube-system") {
+		t.Error("kube-system should be denied (excluded)")
+	}
+
+	nf2 := config.NamespaceFilter{Exclude: []string{"kube-system"}}
+	if !nf2.Allowed("prod") {
+		t.Error("prod should be allowed when no include list")
+	}
+	if nf2.Allowed("kube-system") {
+		t.Error("kube-system should be denied")
 	}
 }
 

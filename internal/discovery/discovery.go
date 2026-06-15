@@ -36,14 +36,38 @@ type Target struct {
 
 	PodUID          string
 	PodPhase        string
+	PodReady        string
 	ControllerKind  string
 	ControllerName  string
 	ContainerImage  string
 	ContainerID     string
+	ContainerInit   string
 	HostIP          string
 	PodIP           string
 	NodeIP          string
 	ServicePortName string
+
+	PortName     string
+	PortNumber   string
+	PortProtocol string
+
+	ServiceType         string
+	ServiceClusterIP    string
+	ServiceExternalName string
+
+	NodeProviderID string
+	NodeAddresses  map[string]string
+
+	EndpointReady       string
+	EndpointHostname    string
+	EndpointNodeName    string
+	EndpointZone        string
+	EndpointAddressType string
+	EndpointSliceName   string
+
+	IngressClassName string
+	IngressPath      string
+	IngressScheme    string
 
 	ScrapeInterval time.Duration
 	ScrapeTimeout  time.Duration
@@ -124,6 +148,7 @@ type Watcher struct {
 	podStore       cache.Store
 	svcStore       cache.Store
 	epStore        cache.Store
+	endpointsStore cache.Store
 	nodeStore      cache.Store
 	ingressStore   cache.Store
 	namespaceStore cache.Store
@@ -196,7 +221,7 @@ func (w *Watcher) buildInformers() map[string]cache.SharedInformer {
 			},
 			&corev1.Pod{}, func(s cache.Store) { w.podStore = s })
 	}
-	if w.cfg.Roles.EndpointSlice || w.cfg.Roles.ServiceAddress {
+	if w.cfg.Roles.EndpointSlice || w.cfg.Roles.ServiceAddress || w.cfg.Roles.Endpoints {
 		out["service"] = w.newInformer(
 			func(o metav1.ListOptions) (runtime.Object, error) {
 				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.ServiceLabel, w.cfg.Selectors.ServiceField
@@ -219,6 +244,18 @@ func (w *Watcher) buildInformers() map[string]cache.SharedInformer {
 				return w.client.DiscoveryV1().EndpointSlices(w.cfg.Namespace).Watch(w.ctx, o)
 			},
 			&discoveryv1.EndpointSlice{}, func(s cache.Store) { w.epStore = s })
+	}
+	if w.cfg.Roles.Endpoints {
+		out["endpoints"] = w.newInformer(
+			func(o metav1.ListOptions) (runtime.Object, error) {
+				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.EndpointsLabel, w.cfg.Selectors.EndpointsField
+				return w.client.CoreV1().Endpoints(w.cfg.Namespace).List(w.ctx, o)
+			},
+			func(o metav1.ListOptions) (watch.Interface, error) {
+				o.LabelSelector, o.FieldSelector = w.cfg.Selectors.EndpointsLabel, w.cfg.Selectors.EndpointsField
+				return w.client.CoreV1().Endpoints(w.cfg.Namespace).Watch(w.ctx, o)
+			},
+			&corev1.Endpoints{}, func(s cache.Store) { w.endpointsStore = s }) //nolint:staticcheck // legacy endpoints role for parity
 	}
 	if w.cfg.Roles.Node {
 		out["node"] = w.newInformer(
@@ -320,7 +357,7 @@ func (w *Watcher) reconcile() {
 	if w.cfg.Roles.Pod && w.podStore != nil {
 		for _, obj := range w.podStore.List() {
 			pod, ok := obj.(*corev1.Pod)
-			if !ok {
+			if !ok || !w.namespaceOK(pod.Namespace) {
 				continue
 			}
 			for _, t := range targetsFromPod(pod, w.cfg, k) {
@@ -332,7 +369,7 @@ func (w *Watcher) reconcile() {
 	if w.cfg.Roles.EndpointSlice && w.epStore != nil {
 		for _, obj := range w.epStore.List() {
 			ep, ok := obj.(*discoveryv1.EndpointSlice)
-			if !ok {
+			if !ok || !w.namespaceOK(ep.Namespace) {
 				continue
 			}
 			svcName := ep.Labels[discoveryv1.LabelServiceName]
@@ -352,10 +389,23 @@ func (w *Watcher) reconcile() {
 	if w.cfg.Roles.ServiceAddress && w.svcStore != nil {
 		for _, obj := range w.svcStore.List() {
 			svc, ok := obj.(*corev1.Service)
-			if !ok {
+			if !ok || !w.namespaceOK(svc.Namespace) {
 				continue
 			}
 			for _, t := range targetsFromService(svc, w.cfg, k, w.namespaceStore) {
+				newTargets[t.Name] = t
+			}
+		}
+	}
+
+	if w.cfg.Roles.Endpoints && w.endpointsStore != nil {
+		for _, obj := range w.endpointsStore.List() {
+			eps, ok := obj.(*corev1.Endpoints) //nolint:staticcheck // legacy endpoints role for parity
+			if !ok || !w.namespaceOK(eps.Namespace) {
+				continue
+			}
+			svc, _ := w.lookupService(eps.Namespace, eps.Name)
+			for _, t := range targetsFromEndpoints(eps, svc, w.cfg, k, w.podStore, w.nodeStore, w.namespaceStore) {
 				newTargets[t.Name] = t
 			}
 		}
@@ -376,7 +426,7 @@ func (w *Watcher) reconcile() {
 	if w.cfg.Roles.Ingress && w.ingressStore != nil {
 		for _, obj := range w.ingressStore.List() {
 			ing, ok := obj.(*netv1.Ingress)
-			if !ok {
+			if !ok || !w.namespaceOK(ing.Namespace) {
 				continue
 			}
 			for _, t := range targetsFromIngress(ing, w.cfg, k) {
@@ -387,6 +437,10 @@ func (w *Watcher) reconcile() {
 
 	w.targets = newTargets
 	w.emit()
+}
+
+func (w *Watcher) namespaceOK(namespace string) bool {
+	return w.cfg.Namespaces.Allowed(namespace)
 }
 
 func (w *Watcher) lookupService(namespace, name string) (*corev1.Service, bool) {
@@ -450,18 +504,22 @@ func applyScrapeSettings(t *Target, ann map[string]string, k keys) {
 
 func metadataMaps(prefix string, labels, annotations map[string]string, cfg config.Config) (lblOut, annOut map[string]string) {
 	if cfg.IncludeLabels && len(labels) > 0 {
-		lblOut = make(map[string]string, len(labels))
+		lblOut = make(map[string]string, len(labels)*2)
 		for key, v := range labels {
-			lblOut[prefix+"_label_"+sanitizeMetaKey(key)] = v
+			sk := sanitizeMetaKey(key)
+			lblOut[prefix+"_label_"+sk] = v
+			lblOut[prefix+"_labelpresent_"+sk] = "true"
 		}
 	}
 	if cfg.IncludeAnnotations && len(annotations) > 0 {
-		annOut = make(map[string]string, len(annotations))
+		annOut = make(map[string]string, len(annotations)*2)
 		for key, v := range annotations {
 			if strings.HasPrefix(key, cfg.AnnotationPrefix+"/") {
 				continue
 			}
-			annOut[prefix+"_annotation_"+sanitizeMetaKey(key)] = v
+			sk := sanitizeMetaKey(key)
+			annOut[prefix+"_annotation_"+sk] = v
+			annOut[prefix+"_annotationpresent_"+sk] = "true"
 		}
 	}
 	return lblOut, annOut
@@ -480,10 +538,12 @@ func attachNodeLabels(t *Target, nodeName string, nodeStore cache.Store, attach 
 		return
 	}
 	if t.Labels == nil {
-		t.Labels = make(map[string]string, len(node.Labels))
+		t.Labels = make(map[string]string, len(node.Labels)*2)
 	}
 	for key, v := range node.Labels {
-		t.Labels["node_label_"+sanitizeMetaKey(key)] = v
+		sk := sanitizeMetaKey(key)
+		t.Labels["node_label_"+sk] = v
+		t.Labels["node_labelpresent_"+sk] = "true"
 	}
 }
 
@@ -500,10 +560,12 @@ func attachNamespaceLabels(t *Target, namespace string, nsStore cache.Store, att
 		return
 	}
 	if t.Labels == nil {
-		t.Labels = make(map[string]string, len(ns.Labels))
+		t.Labels = make(map[string]string, len(ns.Labels)*2)
 	}
 	for key, v := range ns.Labels {
-		t.Labels["namespace_label_"+sanitizeMetaKey(key)] = v
+		sk := sanitizeMetaKey(key)
+		t.Labels["namespace_label_"+sk] = v
+		t.Labels["namespace_labelpresent_"+sk] = "true"
 	}
 }
 
@@ -529,6 +591,14 @@ func containerStatusFor(statuses []corev1.ContainerStatus, name string) (image, 
 	return "", ""
 }
 
+type podPort struct {
+	container string
+	name      string
+	number    int32
+	protocol  string
+	isInit    bool
+}
+
 func targetsFromPod(pod *corev1.Pod, cfg config.Config, k keys) []Target {
 	if !scrapeEnabled(pod.Annotations, k) {
 		return nil
@@ -542,70 +612,132 @@ func targetsFromPod(pod *corev1.Pod, cfg config.Config, k keys) []Target {
 	scrapePortStr := pod.Annotations[k.port]
 
 	ckind, cname := controllerOf(pod)
-	chosenContainer := ""
 
-	var portList []int32
+	var ports []podPort
 	if scrapePortStr != "" {
 		if p, err := strconv.ParseInt(scrapePortStr, 10, 32); err == nil && p > 0 {
-			portList = []int32{int32(p)}
-			chosenContainer = findContainerByPort(pod, int32(p))
+			ports = append(ports, findContainerPort(pod, int32(p)))
 		}
 	}
-	if len(portList) == 0 {
-		for _, c := range pod.Spec.Containers {
-			for _, cp := range c.Ports {
-				portList = append(portList, cp.ContainerPort)
+	if len(ports) == 0 {
+		for i := range pod.Spec.Containers {
+			c := &pod.Spec.Containers[i]
+			for j := range c.Ports {
+				cp := &c.Ports[j]
+				ports = append(ports, podPort{
+					container: c.Name,
+					name:      cp.Name,
+					number:    cp.ContainerPort,
+					protocol:  string(cp.Protocol),
+				})
 			}
-			if len(portList) > 0 {
-				chosenContainer = c.Name
+			if len(ports) > 0 {
 				break
 			}
 		}
 	}
-	if len(portList) == 0 {
+	if len(ports) == 0 {
+		for i := range pod.Spec.InitContainers {
+			c := &pod.Spec.InitContainers[i]
+			for j := range c.Ports {
+				cp := &c.Ports[j]
+				ports = append(ports, podPort{
+					container: c.Name,
+					name:      cp.Name,
+					number:    cp.ContainerPort,
+					protocol:  string(cp.Protocol),
+					isInit:    true,
+				})
+			}
+		}
+	}
+	if len(ports) == 0 {
 		return nil
 	}
-
-	cImage, cID := containerStatusFor(pod.Status.ContainerStatuses, chosenContainer)
 
 	base := Target{}
 	base.Role = "pod"
 	base.Namespace = pod.Namespace
 	base.Pod = pod.Name
 	base.Node = pod.Spec.NodeName
-	base.Container = chosenContainer
 	base.PodUID = string(pod.UID)
 	base.PodPhase = string(pod.Status.Phase)
+	base.PodReady = podReady(pod)
 	base.ControllerKind = ckind
 	base.ControllerName = cname
-	base.ContainerImage = cImage
-	base.ContainerID = cID
 	base.HostIP = pod.Status.HostIP
 	base.PodIP = pod.Status.PodIP
 	applyScrapeSettings(&base, pod.Annotations, k)
 	base.Labels, base.Annotations = metadataMaps("pod", pod.Labels, pod.Annotations, cfg)
 
-	targets := make([]Target, 0, len(portList))
-	for _, port := range portList {
+	targets := make([]Target, 0, len(ports))
+	for _, pp := range ports {
 		t := base
-		hostPort := net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port)))
+		hostPort := net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(pp.number)))
 		t.Instance = hostPort
-		t.Name = sanitizeName(fmt.Sprintf("pod_%s_%s_%d", pod.Namespace, pod.Name, port))
+		t.Name = sanitizeName(fmt.Sprintf("pod_%s_%s_%d", pod.Namespace, pod.Name, pp.number))
 		t.URL = buildURL(scheme, hostPort, path, t.Params)
+		t.Container = pp.container
+		t.PortName = pp.name
+		t.PortNumber = strconv.FormatInt(int64(pp.number), 10)
+		t.PortProtocol = pp.protocol
+		t.ContainerInit = boolStr(pp.isInit)
+		cImage, cID := containerStatusFor(pod.Status.ContainerStatuses, pp.container)
+		if cImage == "" {
+			cImage, cID = containerStatusFor(pod.Status.InitContainerStatuses, pp.container)
+		}
+		t.ContainerImage = cImage
+		t.ContainerID = cID
 		targets = append(targets, t)
 	}
 	return targets
 }
 
-func findContainerByPort(pod *corev1.Pod, port int32) string {
-	for _, c := range pod.Spec.Containers {
-		for _, cp := range c.Ports {
-			if cp.ContainerPort == port {
-				return c.Name
-			}
+func podReady(pod *corev1.Pod) string {
+	for i := range pod.Status.Conditions {
+		if pod.Status.Conditions[i].Type == corev1.PodReady {
+			return string(pod.Status.Conditions[i].Status)
 		}
 	}
 	return ""
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+func findContainerPort(pod *corev1.Pod, port int32) podPort {
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		for j := range c.Ports {
+			if c.Ports[j].ContainerPort == port {
+				return podPort{
+					container: c.Name,
+					name:      c.Ports[j].Name,
+					number:    c.Ports[j].ContainerPort,
+					protocol:  string(c.Ports[j].Protocol),
+				}
+			}
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		for j := range c.Ports {
+			if c.Ports[j].ContainerPort == port {
+				return podPort{
+					container: c.Name,
+					name:      c.Ports[j].Name,
+					number:    c.Ports[j].ContainerPort,
+					protocol:  string(c.Ports[j].Protocol),
+					isInit:    true,
+				}
+			}
+		}
+	}
+	return podPort{number: port}
 }
 
 func targetsFromEndpointSlice(epSlice *discoveryv1.EndpointSlice, svc *corev1.Service,
@@ -629,16 +761,18 @@ func targetsFromEndpointSlice(epSlice *discoveryv1.EndpointSlice, svc *corev1.Se
 	for _, port := range ports {
 		portNum := int32(0)
 		portName := ""
+		portProto := ""
 		if port.Port != nil {
 			portNum = *port.Port
 		}
 		if port.Name != nil {
 			portName = *port.Name
 		}
+		if port.Protocol != nil {
+			portProto = string(*port.Protocol)
+		}
 		for _, ep := range epSlice.Endpoints {
-			if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
-				continue
-			}
+			ready := ep.Conditions.Ready != nil && *ep.Conditions.Ready
 			for _, addr := range ep.Addresses {
 				hostPort := net.JoinHostPort(addr, strconv.Itoa(int(portNum)))
 				t := Target{}
@@ -649,17 +783,32 @@ func targetsFromEndpointSlice(epSlice *discoveryv1.EndpointSlice, svc *corev1.Se
 				t.URL = buildURL(scheme, hostPort, path, svc.Annotations[k.params])
 				t.Name = sanitizeName(fmt.Sprintf("ep_%s_%s_%s_%d", epSlice.Namespace, svc.Name, sanitizeIP(addr), portNum))
 				t.ServicePortName = portName
+				t.PortName = portName
+				t.PortNumber = strconv.FormatInt(int64(portNum), 10)
+				t.PortProtocol = portProto
+				t.EndpointSliceName = epSlice.Name
+				t.EndpointReady = boolStr(ready)
+				t.EndpointAddressType = string(epSlice.AddressType)
+				if ep.Hostname != nil {
+					t.EndpointHostname = *ep.Hostname
+				}
+				if ep.NodeName != nil {
+					t.EndpointNodeName = *ep.NodeName
+					t.Node = *ep.NodeName
+				}
+				t.EndpointZone = endpointZone(ep)
 				applyScrapeSettings(&t, svc.Annotations, k)
 				t.Labels = cloneMap(svcLbl)
 				t.Annotations = cloneMap(svcAnn)
 
-				if ep.TargetRef != nil && ep.TargetRef.Kind == "Pod" {
+				if ep.TargetRef != nil {
 					t.Pod = ep.TargetRef.Name
-					if podStore != nil {
+					if ep.TargetRef.Kind == "Pod" && podStore != nil {
 						if pod, ok := lookupPod(podStore, epSlice.Namespace, ep.TargetRef.Name); ok {
 							t.Node = pod.Spec.NodeName
 							t.PodUID = string(pod.UID)
 							t.PodPhase = string(pod.Status.Phase)
+							t.PodReady = podReady(pod)
 							t.ControllerKind, t.ControllerName = controllerOf(pod)
 							t.HostIP = pod.Status.HostIP
 							t.PodIP = pod.Status.PodIP
@@ -677,6 +826,85 @@ func targetsFromEndpointSlice(epSlice *discoveryv1.EndpointSlice, svc *corev1.Se
 	return targets
 }
 
+func endpointZone(ep discoveryv1.Endpoint) string {
+	if ep.DeprecatedTopology != nil {
+		if z, ok := ep.DeprecatedTopology["topology.kubernetes.io/zone"]; ok {
+			return z
+		}
+	}
+	if ep.Zone != nil {
+		return *ep.Zone
+	}
+	return ""
+}
+
+func targetsFromEndpoints(eps *corev1.Endpoints, svc *corev1.Service, cfg config.Config, k keys, podStore, nodeStore, nsStore cache.Store) []Target { //nolint:staticcheck // legacy endpoints role for parity
+	if svc == nil {
+		return nil
+	}
+	if !scrapeEnabled(svc.Annotations, k) {
+		return nil
+	}
+
+	scheme := defaultStr(svc.Annotations[k.scheme], "http")
+	path := defaultStr(svc.Annotations[k.path], "/metrics")
+
+	svcLbl, svcAnn := metadataMaps("endpoints", svc.Labels, svc.Annotations, cfg)
+
+	var targets []Target
+	for i := range eps.Subsets {
+		subset := &eps.Subsets[i]
+		for j := range subset.Ports {
+			sp := &subset.Ports[j]
+			portNum := sp.Port
+			for _, addr := range subset.Addresses {
+				hostPort := net.JoinHostPort(addr.IP, strconv.Itoa(int(portNum)))
+				t := Target{}
+				t.Role = "endpoints"
+				t.Namespace = eps.Namespace
+				t.Service = svc.Name
+				t.Instance = hostPort
+				t.URL = buildURL(scheme, hostPort, path, svc.Annotations[k.params])
+				t.Name = sanitizeName(fmt.Sprintf("ep_%s_%s_%s_%d", eps.Namespace, svc.Name, sanitizeIP(addr.IP), portNum))
+				t.PortName = sp.Name
+				t.PortNumber = strconv.FormatInt(int64(portNum), 10)
+				t.PortProtocol = string(sp.Protocol)
+				t.EndpointReady = "true"
+				if addr.Hostname != "" {
+					t.EndpointHostname = addr.Hostname
+				}
+				if addr.NodeName != nil {
+					t.EndpointNodeName = *addr.NodeName
+					t.Node = *addr.NodeName
+				}
+				applyScrapeSettings(&t, svc.Annotations, k)
+				t.Labels = cloneMap(svcLbl)
+				t.Annotations = cloneMap(svcAnn)
+				if addr.TargetRef != nil {
+					t.Pod = addr.TargetRef.Name
+					if addr.TargetRef.Kind == "Pod" && podStore != nil {
+						if pod, ok := lookupPod(podStore, eps.Namespace, addr.TargetRef.Name); ok {
+							t.Node = pod.Spec.NodeName
+							t.PodUID = string(pod.UID)
+							t.PodPhase = string(pod.Status.Phase)
+							t.PodReady = podReady(pod)
+							t.ControllerKind, t.ControllerName = controllerOf(pod)
+							t.HostIP = pod.Status.HostIP
+							t.PodIP = pod.Status.PodIP
+							pLbl, _ := metadataMaps("pod", pod.Labels, pod.Annotations, cfg)
+							mergeMaps(&t.Labels, pLbl)
+							attachNodeLabels(&t, pod.Spec.NodeName, nodeStore, cfg.AttachNodeMetadata)
+						}
+					}
+				}
+				attachNamespaceLabels(&t, eps.Namespace, nsStore, cfg.AttachNsMetadata)
+				targets = append(targets, t)
+			}
+		}
+	}
+	return targets
+}
+
 func targetsFromService(svc *corev1.Service, cfg config.Config, k keys, nsStore cache.Store) []Target {
 	if !scrapeEnabled(svc.Annotations, k) {
 		return nil
@@ -687,19 +915,42 @@ func targetsFromService(svc *corev1.Service, cfg config.Config, k keys, nsStore 
 	scrapePortStr := svc.Annotations[k.port]
 
 	host := svc.Spec.ClusterIP
+	external := ""
+	if svc.Spec.Type == corev1.ServiceTypeExternalName {
+		external = svc.Spec.ExternalName
+		host = external
+	}
 	if host == "" || host == "None" {
 		host = fmt.Sprintf("%s.%s.%s", svc.Name, svc.Namespace, cfg.ServiceDNSSuffix)
 	}
 
-	var ports []int32
+	type svcPort struct {
+		number   int32
+		name     string
+		protocol string
+	}
+	var ports []svcPort
 	if scrapePortStr != "" {
 		if p, err := strconv.ParseInt(scrapePortStr, 10, 32); err == nil && p > 0 {
-			ports = []int32{int32(p)}
+			sp := svcPort{number: int32(p)}
+			for i := range svc.Spec.Ports {
+				if svc.Spec.Ports[i].Port == int32(p) {
+					sp.name = svc.Spec.Ports[i].Name
+					sp.protocol = string(svc.Spec.Ports[i].Protocol)
+					break
+				}
+			}
+			ports = []svcPort{sp}
 		}
 	}
 	if len(ports) == 0 {
-		for _, sp := range svc.Spec.Ports {
-			ports = append(ports, sp.Port)
+		for i := range svc.Spec.Ports {
+			sp := &svc.Spec.Ports[i]
+			ports = append(ports, svcPort{
+				number:   sp.Port,
+				name:     sp.Name,
+				protocol: string(sp.Protocol),
+			})
 		}
 	}
 	if len(ports) == 0 {
@@ -709,14 +960,21 @@ func targetsFromService(svc *corev1.Service, cfg config.Config, k keys, nsStore 
 	svcLbl, svcAnn := metadataMaps("service", svc.Labels, svc.Annotations, cfg)
 
 	targets := make([]Target, 0, len(ports))
-	for _, port := range ports {
+	for _, sp := range ports {
 		t := Target{}
 		t.Role = "service"
 		t.Namespace = svc.Namespace
 		t.Service = svc.Name
-		t.Instance = net.JoinHostPort(host, strconv.Itoa(int(port)))
+		t.Instance = net.JoinHostPort(host, strconv.Itoa(int(sp.number)))
 		t.URL = buildURL(scheme, t.Instance, path, svc.Annotations[k.params])
-		t.Name = sanitizeName(fmt.Sprintf("svc_%s_%s_%d", svc.Namespace, svc.Name, port))
+		t.Name = sanitizeName(fmt.Sprintf("svc_%s_%s_%d", svc.Namespace, svc.Name, sp.number))
+		t.ServiceType = string(svc.Spec.Type)
+		t.ServiceClusterIP = svc.Spec.ClusterIP
+		t.ServiceExternalName = external
+		t.ServicePortName = sp.name
+		t.PortName = sp.name
+		t.PortNumber = strconv.FormatInt(int64(sp.number), 10)
+		t.PortProtocol = sp.protocol
 		applyScrapeSettings(&t, svc.Annotations, k)
 		t.Labels = cloneMap(svcLbl)
 		t.Annotations = cloneMap(svcAnn)
@@ -750,12 +1008,25 @@ func targetsFromNode(node *corev1.Node, cfg config.Config, k keys) []Target {
 	t.Role = "node"
 	t.Node = node.Name
 	t.NodeIP = host
+	t.NodeProviderID = node.Spec.ProviderID
+	t.NodeAddresses = nodeAddresses(node)
 	t.Instance = net.JoinHostPort(host, strconv.Itoa(int(port)))
 	t.URL = buildURL(scheme, t.Instance, path, node.Annotations[k.params])
 	t.Name = sanitizeName(fmt.Sprintf("node_%s_%d", node.Name, port))
 	applyScrapeSettings(&t, node.Annotations, k)
 	t.Labels, t.Annotations = metadataMaps("node", node.Labels, node.Annotations, cfg)
 	return []Target{t}
+}
+
+func nodeAddresses(node *corev1.Node) map[string]string {
+	if len(node.Status.Addresses) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(node.Status.Addresses))
+	for _, addr := range node.Status.Addresses {
+		out[strings.ToLower(string(addr.Type))] = addr.Address
+	}
+	return out
 }
 
 func targetsFromIngress(ing *netv1.Ingress, cfg config.Config, k keys) []Target {
@@ -784,9 +1055,16 @@ func targetsFromIngress(ing *netv1.Ingress, cfg config.Config, k keys) []Target 
 
 	var targets []Target
 	seen := make(map[string]bool)
-	addHost := func(host string) {
+	className := ""
+	if ing.Spec.IngressClassName != nil {
+		className = *ing.Spec.IngressClassName
+	}
+	addHost := func(host, rulePath string) {
 		if host == "" {
 			host = ing.Name
+		}
+		if rulePath == "" {
+			rulePath = "/"
 		}
 		key := host + ":" + strconv.Itoa(int(port))
 		if seen[key] {
@@ -799,6 +1077,9 @@ func targetsFromIngress(ing *netv1.Ingress, cfg config.Config, k keys) []Target 
 		t.Instance = key
 		t.URL = buildURL(scheme, key, path, ing.Annotations[k.params])
 		t.Name = sanitizeName(fmt.Sprintf("ing_%s_%s_%s", ing.Namespace, ing.Name, sanitizeIP(host)))
+		t.IngressClassName = className
+		t.IngressPath = rulePath
+		t.IngressScheme = scheme
 		applyScrapeSettings(&t, ing.Annotations, k)
 		t.Labels = cloneMap(ingLbl)
 		t.Annotations = cloneMap(ingAnn)
@@ -806,10 +1087,14 @@ func targetsFromIngress(ing *netv1.Ingress, cfg config.Config, k keys) []Target 
 	}
 
 	for _, rule := range ing.Spec.Rules {
-		addHost(rule.Host)
+		rulePath := ""
+		if rule.HTTP != nil && len(rule.HTTP.Paths) > 0 {
+			rulePath = rule.HTTP.Paths[0].Path
+		}
+		addHost(rule.Host, rulePath)
 	}
 	if len(targets) == 0 {
-		addHost("")
+		addHost("", "")
 	}
 	return targets
 }
